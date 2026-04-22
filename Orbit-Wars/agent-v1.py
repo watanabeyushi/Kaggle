@@ -6,6 +6,8 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 SUN_X = 50.0
 SUN_Y = 50.0
 SUN_RADIUS = 10.0
+BOARD_MIN = 0.0
+BOARD_MAX = 100.0
 LAUNCH_CLEARANCE = 0.1
 DEFENSE_MARGIN = 10
 AIM_ITERATIONS = 3
@@ -96,6 +98,18 @@ def ray_circle_hit_distance(src_x, src_y, dir_x, dir_y, center_x, center_y, radi
     return max(0.0, proj - math.sqrt(max(0.0, radius_sq - perp_sq)))
 
 
+def is_in_bounds(x, y):
+    return BOARD_MIN <= x <= BOARD_MAX and BOARD_MIN <= y <= BOARD_MAX
+
+
+def fleet_position_after_time(launch_x, launch_y, angle, num_ships, time_elapsed):
+    speed = estimate_fleet_speed(num_ships)
+    return (
+        launch_x + math.cos(angle) * speed * time_elapsed,
+        launch_y + math.sin(angle) * speed * time_elapsed,
+    )
+
+
 def estimate_fleet_speed(num_ships, max_speed=DEFAULT_MAX_SPEED):
     ships = max(1, int(num_ships))
     if ships == 1:
@@ -138,45 +152,131 @@ def estimate_precise_intercept(
     sweep_aim_x, sweep_aim_y = closest_point_on_segment(
         pred_x, pred_y, sweep_start_x, sweep_start_y, sweep_end_x, sweep_end_y
     )
-    uses_sweep = math.hypot(sweep_end_x - sweep_start_x, sweep_end_y - sweep_start_y) > 1e-6
+    direct_angle = angle
+    direct_validation = validate_intercept_solution(
+        source,
+        target,
+        num_ships,
+        direct_angle,
+        step,
+        initial_planets,
+        angular_velocity_map,
+        max_turns=max(1, eta_turns + 2),
+    )
 
-    if uses_sweep:
-        angle = math.atan2(sweep_aim_y - source.y, sweep_aim_x - source.x)
-        launch_x, launch_y = launch_point(source, angle)
-        time_to_hit = math.hypot(sweep_aim_x - launch_x, sweep_aim_y - launch_y) / max(speed, 1e-9)
-        eta_turns = max(1, int(math.ceil(time_to_hit)))
-        pred_x, pred_y = predict_planet_position(
-            target, time_to_hit, step, initial_planets, angular_velocity_map
+    sweep_validation = None
+    sweep_motion = math.hypot(sweep_end_x - sweep_start_x, sweep_end_y - sweep_start_y)
+    if sweep_motion > 1e-6:
+        sweep_angle = math.atan2(sweep_aim_y - source.y, sweep_aim_x - source.x)
+        sweep_validation = validate_intercept_solution(
+            source,
+            target,
+            num_ships,
+            sweep_angle,
+            step,
+            initial_planets,
+            angular_velocity_map,
+            max_turns=max(1, eta_turns + 2),
         )
-        sweep_start_x, sweep_start_y = predict_planet_position(
-            target, max(0.0, eta_turns - 1), step, initial_planets, angular_velocity_map
-        )
-        sweep_end_x, sweep_end_y = predict_planet_position(
-            target, eta_turns, step, initial_planets, angular_velocity_map
-        )
-        sweep_aim_x, sweep_aim_y = closest_point_on_segment(
-            pred_x, pred_y, sweep_start_x, sweep_start_y, sweep_end_x, sweep_end_y
-        )
-        angle = math.atan2(sweep_aim_y - source.y, sweep_aim_x - source.x)
-        launch_x, launch_y = launch_point(source, angle)
 
-    aim_x, aim_y = (sweep_aim_x, sweep_aim_y) if uses_sweep else (pred_x, pred_y)
+    if direct_validation is not None and (
+        sweep_validation is None or direct_validation["time"] <= sweep_validation["time"]
+    ):
+        return direct_validation
+    if sweep_validation is not None:
+        return sweep_validation
+
     return {
+        "valid": False,
         "time": float(time_to_hit),
         "eta": int(max(1, math.ceil(time_to_hit))),
         "pred_x": float(pred_x),
         "pred_y": float(pred_y),
-        "aim_x": float(aim_x),
-        "aim_y": float(aim_y),
+        "aim_x": float(pred_x),
+        "aim_y": float(pred_y),
         "launch_x": float(launch_x),
         "launch_y": float(launch_y),
-        "angle": float(angle),
-        "uses_sweep": uses_sweep,
+        "angle": float(direct_angle),
+        "uses_sweep": False,
         "sweep_start_x": float(sweep_start_x),
         "sweep_start_y": float(sweep_start_y),
         "sweep_end_x": float(sweep_end_x),
         "sweep_end_y": float(sweep_end_y),
     }
+
+
+def validate_intercept_solution(
+    source, target, num_ships, angle, step, initial_planets, angular_velocity_map, max_turns
+):
+    launch_x, launch_y = launch_point(source, angle)
+    speed = estimate_fleet_speed(num_ships)
+    dir_x = math.cos(angle)
+    dir_y = math.sin(angle)
+    prev_x, prev_y = launch_x, launch_y
+
+    for turn in range(1, max(1, int(max_turns)) + 1):
+        curr_x, curr_y = fleet_position_after_time(launch_x, launch_y, angle, num_ships, turn)
+        target_before_x, target_before_y = predict_planet_position(
+            target, turn - 1, step, initial_planets, angular_velocity_map
+        )
+        target_after_x, target_after_y = predict_planet_position(
+            target, turn, step, initial_planets, angular_velocity_map
+        )
+
+        hit_distance = ray_circle_hit_distance(
+            prev_x, prev_y, dir_x, dir_y, target_before_x, target_before_y, target.radius
+        )
+        if hit_distance is not None and hit_distance <= speed + 1e-6:
+            hit_x = prev_x + dir_x * hit_distance
+            hit_y = prev_y + dir_y * hit_distance
+            return {
+                "valid": True,
+                "time": float(turn - 1 + (hit_distance / max(speed, 1e-9))),
+                "eta": int(turn),
+                "pred_x": float(target_before_x),
+                "pred_y": float(target_before_y),
+                "aim_x": float(hit_x),
+                "aim_y": float(hit_y),
+                "launch_x": float(launch_x),
+                "launch_y": float(launch_y),
+                "angle": float(angle),
+                "uses_sweep": False,
+                "sweep_start_x": float(target_before_x),
+                "sweep_start_y": float(target_before_y),
+                "sweep_end_x": float(target_after_x),
+                "sweep_end_y": float(target_after_y),
+            }
+
+        if point_to_segment_distance(
+            curr_x, curr_y, target_before_x, target_before_y, target_after_x, target_after_y
+        ) <= target.radius + 1e-6:
+            sweep_hit_x, sweep_hit_y = closest_point_on_segment(
+                curr_x, curr_y, target_before_x, target_before_y, target_after_x, target_after_y
+            )
+            return {
+                "valid": True,
+                "time": float(turn),
+                "eta": int(turn),
+                "pred_x": float(target_after_x),
+                "pred_y": float(target_after_y),
+                "aim_x": float(sweep_hit_x),
+                "aim_y": float(sweep_hit_y),
+                "launch_x": float(launch_x),
+                "launch_y": float(launch_y),
+                "angle": float(angle),
+                "uses_sweep": True,
+                "sweep_start_x": float(target_before_x),
+                "sweep_start_y": float(target_before_y),
+                "sweep_end_x": float(target_after_x),
+                "sweep_end_y": float(target_after_y),
+            }
+
+        if not is_in_bounds(curr_x, curr_y):
+            break
+
+        prev_x, prev_y = curr_x, curr_y
+
+    return None
 
 
 def estimate_target_garrison(target, eta_turns):
@@ -303,6 +403,8 @@ def build_regular_attack_candidate(
         initial_planets,
         angular_velocity_map,
     )
+    if not solution.get("valid", False):
+        return None
     eta_turns = solution["eta"]
     ships_needed = compute_attack_need(
         target, eta_turns, friendly_arrivals_by_target, planned_arrivals_by_target
@@ -318,6 +420,8 @@ def build_regular_attack_candidate(
         initial_planets,
         angular_velocity_map,
     )
+    if not solution.get("valid", False):
+        return None
     eta_turns = solution["eta"]
     ships_needed = compute_attack_need(
         target, eta_turns, friendly_arrivals_by_target, planned_arrivals_by_target
@@ -333,6 +437,8 @@ def build_regular_attack_candidate(
         initial_planets,
         angular_velocity_map,
     )
+    if not solution.get("valid", False):
+        return None
     eta_turns = solution["eta"]
     if segment_hits_sun(
         solution["launch_x"], solution["launch_y"], solution["aim_x"], solution["aim_y"]
@@ -464,6 +570,8 @@ def build_intercept_candidate(
         initial_planets,
         angular_velocity_map,
     )
+    if not solution.get("valid", False):
+        return None
     if solution["eta"] != desired_eta:
         return None
 
@@ -522,6 +630,8 @@ def build_supply_candidate(
         initial_planets,
         angular_velocity_map,
     )
+    if not solution.get("valid", False):
+        return None
     eta_turns = solution["eta"]
     incoming_support = estimate_friendly_inbound_ships(
         frontline_target.id, eta_turns, friendly_arrivals_by_target, planned_arrivals_by_target
@@ -546,6 +656,8 @@ def build_supply_candidate(
         initial_planets,
         angular_velocity_map,
     )
+    if not solution.get("valid", False):
+        return None
     eta_turns = solution["eta"]
     incoming_support = estimate_friendly_inbound_ships(
         frontline_target.id, eta_turns, friendly_arrivals_by_target, planned_arrivals_by_target
@@ -566,6 +678,8 @@ def build_supply_candidate(
         initial_planets,
         angular_velocity_map,
     )
+    if not solution.get("valid", False):
+        return None
     eta_turns = solution["eta"]
     if segment_hits_sun(
         solution["launch_x"], solution["launch_y"], solution["aim_x"], solution["aim_y"]
