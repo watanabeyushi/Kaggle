@@ -5,6 +5,7 @@ SUN_X = 50.0
 SUN_Y = 50.0
 SUN_RADIUS = 10.0
 DEFENSE_MARGIN = 10
+AIM_ITERATIONS = 3
 DEFAULT_MAX_SPEED = 6.0
 
 
@@ -65,6 +66,21 @@ def estimate_eta_turns(src_x, src_y, dst_x, dst_y, num_ships):
     distance = math.hypot(dst_x - src_x, dst_y - src_y)
     speed = estimate_fleet_speed(num_ships)
     return max(1, int(math.ceil(distance / max(speed, 1e-9))))
+
+
+def estimate_converged_intercept(
+    src_x, src_y, target, num_ships, step, initial_planets, angular_velocity_map
+):
+    eta_turns = estimate_eta_turns(src_x, src_y, target.x, target.y, num_ships)
+    pred_x, pred_y = target.x, target.y
+
+    for _ in range(AIM_ITERATIONS):
+        pred_x, pred_y = predict_planet_position(
+            target, eta_turns, step, initial_planets, angular_velocity_map
+        )
+        eta_turns = estimate_eta_turns(src_x, src_y, pred_x, pred_y, num_ships)
+
+    return eta_turns, pred_x, pred_y
 
 
 def estimate_target_garrison(target, eta_turns):
@@ -164,7 +180,15 @@ def nearest_planet_sniper(obs):
             continue
 
         initial_ships_needed = nearest.ships + 1
-        eta_turns = estimate_eta_turns(mine.x, mine.y, nearest.x, nearest.y, initial_ships_needed)
+        eta_turns, pred_x, pred_y = estimate_converged_intercept(
+            mine.x,
+            mine.y,
+            nearest,
+            initial_ships_needed,
+            step,
+            initial_planets,
+            angular_velocity_map,
+        )
         predicted_garrison = estimate_target_garrison(nearest, eta_turns)
         raw_ships_needed = predicted_garrison + 1
         friendly_inbound_ships = estimate_friendly_inbound_ships(
@@ -178,9 +202,25 @@ def nearest_planet_sniper(obs):
 
         # Only send if we can capture the target while keeping a reserve at home
         if available_to_send >= ships_needed:
-            pred_x, pred_y = predict_planet_position(
-                nearest, eta_turns, step, initial_planets, angular_velocity_map
+            eta_turns, pred_x, pred_y = estimate_converged_intercept(
+                mine.x,
+                mine.y,
+                nearest,
+                ships_needed,
+                step,
+                initial_planets,
+                angular_velocity_map,
             )
+            predicted_garrison = estimate_target_garrison(nearest, eta_turns)
+            raw_ships_needed = predicted_garrison + 1
+            friendly_inbound_ships = estimate_friendly_inbound_ships(
+                nearest.id, eta_turns, friendly_fleets, planets
+            )
+            ships_needed = max(0, raw_ships_needed - friendly_inbound_ships)
+
+            if ships_needed <= 0 or available_to_send < ships_needed:
+                continue
+
             if segment_hits_sun(mine.x, mine.y, pred_x, pred_y):
                 continue
             # Calculate lead angle from our planet to predicted target position
