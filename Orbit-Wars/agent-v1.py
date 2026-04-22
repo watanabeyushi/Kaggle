@@ -13,6 +13,7 @@ DEFENSE_MARGIN = 10
 AIM_ITERATIONS = 3
 DEFAULT_MAX_SPEED = 6.0
 MAX_FRONTLINE_PLANETS = 3
+STRICT_VALIDATION_THRESHOLD = 40.0
 
 
 def _obs_get(obs, key, default=None):
@@ -126,7 +127,7 @@ def estimate_eta_turns(src_x, src_y, dst_x, dst_y, num_ships):
 
 
 def estimate_precise_intercept(
-    source, target, num_ships, step, initial_planets, angular_velocity_map
+    source, target, num_ships, step, initial_planets, angular_velocity_map, validation_mode="strict"
 ):
     speed = estimate_fleet_speed(num_ships)
     time_to_hit = max(0.0, math.hypot(target.x - source.x, target.y - source.y) / max(speed, 1e-9))
@@ -162,6 +163,7 @@ def estimate_precise_intercept(
         initial_planets,
         angular_velocity_map,
         max_turns=max(1, eta_turns + 2),
+        validation_mode=validation_mode,
     )
 
     sweep_validation = None
@@ -177,6 +179,7 @@ def estimate_precise_intercept(
             initial_planets,
             angular_velocity_map,
             max_turns=max(1, eta_turns + 2),
+            validation_mode=validation_mode,
         )
 
     if direct_validation is not None and (
@@ -206,7 +209,15 @@ def estimate_precise_intercept(
 
 
 def validate_intercept_solution(
-    source, target, num_ships, angle, step, initial_planets, angular_velocity_map, max_turns
+    source,
+    target,
+    num_ships,
+    angle,
+    step,
+    initial_planets,
+    angular_velocity_map,
+    max_turns,
+    validation_mode="strict",
 ):
     launch_x, launch_y = launch_point(source, angle)
     speed = estimate_fleet_speed(num_ships)
@@ -246,6 +257,31 @@ def validate_intercept_solution(
                 "sweep_end_x": float(target_after_x),
                 "sweep_end_y": float(target_after_y),
             }
+
+        if validation_mode == "relaxed":
+            relaxed_hit_distance = ray_circle_hit_distance(
+                prev_x, prev_y, dir_x, dir_y, target_after_x, target_after_y, target.radius
+            )
+            if relaxed_hit_distance is not None and relaxed_hit_distance <= speed + 1e-6:
+                hit_x = prev_x + dir_x * relaxed_hit_distance
+                hit_y = prev_y + dir_y * relaxed_hit_distance
+                return {
+                    "valid": True,
+                    "time": float(turn - 1 + (relaxed_hit_distance / max(speed, 1e-9))),
+                    "eta": int(turn),
+                    "pred_x": float(target_after_x),
+                    "pred_y": float(target_after_y),
+                    "aim_x": float(hit_x),
+                    "aim_y": float(hit_y),
+                    "launch_x": float(launch_x),
+                    "launch_y": float(launch_y),
+                    "angle": float(angle),
+                    "uses_sweep": False,
+                    "sweep_start_x": float(target_before_x),
+                    "sweep_start_y": float(target_before_y),
+                    "sweep_end_x": float(target_after_x),
+                    "sweep_end_y": float(target_after_y),
+                }
 
         if point_to_segment_distance(
             curr_x, curr_y, target_before_x, target_before_y, target_after_x, target_after_y
@@ -367,6 +403,20 @@ def compute_attack_need(
     return max(0, predicted_garrison + 1 - friendly_inbound)
 
 
+def compute_validation_pressure(target, ships_needed, eta_turns):
+    ownership_multiplier = 1.5 if int(target.owner) != -1 else 1.0
+    value = max(1.0, float(target.production))
+    cost = max(1.0, float(ships_needed) * max(1.0, float(eta_turns)))
+    return ownership_multiplier * cost / value
+
+
+def choose_validation_mode(target, ships_needed, eta_turns, candidate_type):
+    if candidate_type == "supply":
+        return "relaxed"
+    pressure = compute_validation_pressure(target, ships_needed, eta_turns)
+    return "strict" if pressure >= STRICT_VALIDATION_THRESHOLD else "relaxed"
+
+
 def segment_hits_sun(src_x, src_y, dst_x, dst_y, sun_x=SUN_X, sun_y=SUN_Y, sun_radius=SUN_RADIUS):
     dx = dst_x - src_x
     dy = dst_y - src_y
@@ -402,6 +452,7 @@ def build_regular_attack_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        validation_mode="relaxed",
     )
     if not solution.get("valid", False):
         return None
@@ -411,6 +462,7 @@ def build_regular_attack_candidate(
     )
     if ships_needed <= 0 or ships_needed > available_to_send:
         return None
+    validation_mode = choose_validation_mode(target, ships_needed, eta_turns, "roi")
 
     solution = estimate_precise_intercept(
         source,
@@ -419,6 +471,7 @@ def build_regular_attack_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        validation_mode=validation_mode,
     )
     if not solution.get("valid", False):
         return None
@@ -454,6 +507,7 @@ def build_regular_attack_candidate(
         "eta": int(eta_turns),
         "angle": solution["angle"],
         "score": roi_score,
+        "validation_mode": validation_mode,
     }
 
 
@@ -561,6 +615,7 @@ def build_intercept_candidate(
     )
     if ships_needed <= 0 or ships_needed > available_to_send:
         return None
+    validation_mode = choose_validation_mode(target, ships_needed, desired_eta, "intercept")
 
     solution = estimate_precise_intercept(
         source,
@@ -569,6 +624,7 @@ def build_intercept_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        validation_mode=validation_mode,
     )
     if not solution.get("valid", False):
         return None
@@ -589,6 +645,7 @@ def build_intercept_candidate(
         "eta": int(desired_eta),
         "angle": solution["angle"],
         "score": intercept_score,
+        "validation_mode": validation_mode,
     }
 
 
@@ -629,6 +686,7 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        validation_mode="relaxed",
     )
     if not solution.get("valid", False):
         return None
@@ -655,6 +713,7 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        validation_mode="relaxed",
     )
     if not solution.get("valid", False):
         return None
@@ -677,6 +736,7 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        validation_mode="relaxed",
     )
     if not solution.get("valid", False):
         return None
@@ -696,7 +756,12 @@ def build_supply_candidate(
         "eta": int(eta_turns),
         "angle": solution["angle"],
         "score": score,
+        "validation_mode": "relaxed",
     }
+
+
+def rank_candidates(candidates):
+    return sorted(candidates, key=lambda candidate: candidate["score"], reverse=True)
 
 
 def nearest_planet_sniper(obs):
@@ -742,7 +807,7 @@ def nearest_planet_sniper(obs):
         if source.id in used_source_ids or get_available_to_send(source) <= 0:
             continue
 
-        best_candidate = None
+        candidates = []
         for target in targets:
             for window in intercept_windows_by_target.get(target.id, []):
                 candidate = build_intercept_candidate(
@@ -757,10 +822,11 @@ def nearest_planet_sniper(obs):
                 )
                 if candidate is None:
                     continue
-                if best_candidate is None or candidate["score"] > best_candidate["score"]:
-                    best_candidate = candidate
+                candidates.append(candidate)
 
-        if best_candidate is not None:
+        ranked_candidates = rank_candidates(candidates)
+        if ranked_candidates:
+            best_candidate = ranked_candidates[0]
             moves.append([best_candidate["source_id"], best_candidate["angle"], best_candidate["ships"]])
             planned_arrivals_by_target[best_candidate["target_id"]].append(
                 (best_candidate["eta"], best_candidate["ships"])
@@ -771,7 +837,7 @@ def nearest_planet_sniper(obs):
         if source.id in used_source_ids or get_available_to_send(source) <= 0:
             continue
 
-        best_candidate = None
+        candidates = []
         for target in targets:
             candidate = build_regular_attack_candidate(
                 source,
@@ -784,10 +850,11 @@ def nearest_planet_sniper(obs):
             )
             if candidate is None:
                 continue
-            if best_candidate is None or candidate["score"] > best_candidate["score"]:
-                best_candidate = candidate
+            candidates.append(candidate)
 
-        if best_candidate is not None:
+        ranked_candidates = rank_candidates(candidates)
+        if ranked_candidates:
+            best_candidate = ranked_candidates[0]
             moves.append([best_candidate["source_id"], best_candidate["angle"], best_candidate["ships"]])
             planned_arrivals_by_target[best_candidate["target_id"]].append(
                 (best_candidate["eta"], best_candidate["ships"])
@@ -798,7 +865,7 @@ def nearest_planet_sniper(obs):
         if source.id in used_source_ids or get_available_to_send(source) <= 0:
             continue
 
-        best_candidate = None
+        candidates = []
         for frontline_target in frontline_planets:
             candidate = build_supply_candidate(
                 source,
@@ -812,10 +879,11 @@ def nearest_planet_sniper(obs):
             )
             if candidate is None:
                 continue
-            if best_candidate is None or candidate["score"] > best_candidate["score"]:
-                best_candidate = candidate
+            candidates.append(candidate)
 
-        if best_candidate is not None:
+        ranked_candidates = rank_candidates(candidates)
+        if ranked_candidates:
+            best_candidate = ranked_candidates[0]
             moves.append([best_candidate["source_id"], best_candidate["angle"], best_candidate["ships"]])
             planned_arrivals_by_target[best_candidate["target_id"]].append(
                 (best_candidate["eta"], best_candidate["ships"])
