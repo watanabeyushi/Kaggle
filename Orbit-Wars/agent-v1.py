@@ -4,6 +4,7 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 SUN_X = 50.0
 SUN_Y = 50.0
 SUN_RADIUS = 10.0
+DEFENSE_MARGIN = 10
 DEFAULT_MAX_SPEED = 6.0
 
 
@@ -111,9 +112,10 @@ def nearest_planet_sniper(obs):
 
         # How many ships do we need? Target's garrison + 1
         ships_needed = max(nearest.ships + 1, 20)
+        available_to_send = mine.ships - DEFENSE_MARGIN
 
         # Only send if we have enough
-        if mine.ships >= ships_needed:
+        if available_to_send >= ships_needed:
             eta_turns = estimate_eta_turns(mine.x, mine.y, nearest.x, nearest.y, ships_needed)
             pred_x, pred_y = predict_planet_position(
                 nearest, eta_turns, step, initial_planets, angular_velocity_map
