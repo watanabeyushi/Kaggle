@@ -1,5 +1,5 @@
 import math
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 
 SUN_X = 50.0
 SUN_Y = 50.0
@@ -73,6 +73,50 @@ def estimate_target_garrison(target, eta_turns):
     return target.ships + target.production * eta_turns
 
 
+def infer_fleet_target_and_eta(fleet, planets):
+    best_planet = None
+    best_eta = None
+    dir_x = math.cos(fleet.angle)
+    dir_y = math.sin(fleet.angle)
+    speed = estimate_fleet_speed(fleet.ships)
+
+    for planet in planets:
+        dx = planet.x - fleet.x
+        dy = planet.y - fleet.y
+        proj = dx * dir_x + dy * dir_y
+        if proj < 0:
+            continue
+
+        perp_sq = dx * dx + dy * dy - proj * proj
+        radius_sq = planet.radius * planet.radius
+        if perp_sq >= radius_sq:
+            continue
+
+        hit_distance = max(0.0, proj - math.sqrt(max(0.0, radius_sq - perp_sq)))
+        eta_turns = int(math.ceil(hit_distance / max(speed, 1e-9)))
+        eta_turns = max(1, eta_turns)
+
+        if best_eta is None or eta_turns < best_eta:
+            best_eta = eta_turns
+            best_planet = planet
+
+    return best_planet, best_eta
+
+
+def estimate_friendly_inbound_ships(target_id, eta_turns, friendly_fleets, planets):
+    inbound_ships = 0
+    for fleet in friendly_fleets:
+        target_planet, fleet_eta = infer_fleet_target_and_eta(fleet, planets)
+        if target_planet is None or fleet_eta is None:
+            continue
+        if target_planet.id != target_id:
+            continue
+        if fleet_eta > eta_turns:
+            continue
+        inbound_ships += int(fleet.ships)
+    return inbound_ships
+
+
 def segment_hits_sun(src_x, src_y, dst_x, dst_y, sun_x=SUN_X, sun_y=SUN_Y, sun_radius=SUN_RADIUS):
     dx = dst_x - src_x
     dy = dst_y - src_y
@@ -91,14 +135,17 @@ def nearest_planet_sniper(obs):
     player = _obs_get(obs, "player", 0)
     step = int(_obs_get(obs, "step", 0) or 0)
     raw_planets = _obs_get(obs, "planets", [])
+    raw_fleets = _obs_get(obs, "fleets", [])
     initial_planets = _obs_get(obs, "initial_planets", [])
     angular_velocity = _obs_get(obs, "angular_velocity", [])
     angular_velocity_map = _build_angular_velocity_map(angular_velocity)
     planets = [Planet(*p) for p in raw_planets]
+    fleets = [Fleet(*f) for f in raw_fleets]
 
     # Separate our planets from targets
     my_planets = [p for p in planets if p.owner == player]
     targets = [p for p in planets if p.owner != player]
+    friendly_fleets = [f for f in fleets if f.owner == player]
 
     if not targets:
         return moves
@@ -119,8 +166,15 @@ def nearest_planet_sniper(obs):
         initial_ships_needed = nearest.ships + 1
         eta_turns = estimate_eta_turns(mine.x, mine.y, nearest.x, nearest.y, initial_ships_needed)
         predicted_garrison = estimate_target_garrison(nearest, eta_turns)
-        ships_needed = predicted_garrison + 1
+        raw_ships_needed = predicted_garrison + 1
+        friendly_inbound_ships = estimate_friendly_inbound_ships(
+            nearest.id, eta_turns, friendly_fleets, planets
+        )
+        ships_needed = max(0, raw_ships_needed - friendly_inbound_ships)
         available_to_send = mine.ships - DEFENSE_MARGIN
+
+        if ships_needed <= 0:
+            continue
 
         # Only send if we can capture the target while keeping a reserve at home
         if available_to_send >= ships_needed:
