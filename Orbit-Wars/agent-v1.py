@@ -67,6 +67,12 @@ def estimate_eta_turns(src_x, src_y, dst_x, dst_y, num_ships):
     return max(1, int(math.ceil(distance / max(speed, 1e-9))))
 
 
+def estimate_target_garrison(target, eta_turns):
+    if target.owner == -1:
+        return target.ships
+    return target.ships + target.production * eta_turns
+
+
 def segment_hits_sun(src_x, src_y, dst_x, dst_y, sun_x=SUN_X, sun_y=SUN_Y, sun_radius=SUN_RADIUS):
     dx = dst_x - src_x
     dy = dst_y - src_y
@@ -110,13 +116,14 @@ def nearest_planet_sniper(obs):
         if nearest is None:
             continue
 
-        # How many ships do we need? Target's garrison + 1
-        ships_needed = max(nearest.ships + 1, 20)
+        initial_ships_needed = nearest.ships + 1
+        eta_turns = estimate_eta_turns(mine.x, mine.y, nearest.x, nearest.y, initial_ships_needed)
+        predicted_garrison = estimate_target_garrison(nearest, eta_turns)
+        ships_needed = predicted_garrison + 1
         available_to_send = mine.ships - DEFENSE_MARGIN
 
-        # Only send if we have enough
+        # Only send if we can capture the target while keeping a reserve at home
         if available_to_send >= ships_needed:
-            eta_turns = estimate_eta_turns(mine.x, mine.y, nearest.x, nearest.y, ships_needed)
             pred_x, pred_y = predict_planet_position(
                 nearest, eta_turns, step, initial_planets, angular_velocity_map
             )
