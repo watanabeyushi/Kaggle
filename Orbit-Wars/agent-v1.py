@@ -3,6 +3,7 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 
 SUN_X = 50.0
 SUN_Y = 50.0
+SUN_RADIUS = 10.0
 DEFAULT_MAX_SPEED = 6.0
 
 
@@ -64,6 +65,20 @@ def estimate_eta_turns(src_x, src_y, dst_x, dst_y, num_ships):
     speed = estimate_fleet_speed(num_ships)
     return max(1, int(math.ceil(distance / max(speed, 1e-9))))
 
+
+def segment_hits_sun(src_x, src_y, dst_x, dst_y, sun_x=SUN_X, sun_y=SUN_Y, sun_radius=SUN_RADIUS):
+    dx = dst_x - src_x
+    dy = dst_y - src_y
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq <= 1e-12:
+        return math.hypot(src_x - sun_x, src_y - sun_y) <= sun_radius
+
+    t = ((sun_x - src_x) * dx + (sun_y - src_y) * dy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    closest_x = src_x + t * dx
+    closest_y = src_y + t * dy
+    return math.hypot(closest_x - sun_x, closest_y - sun_y) <= sun_radius
+
 def nearest_planet_sniper(obs):
     moves = []
     player = _obs_get(obs, "player", 0)
@@ -103,6 +118,8 @@ def nearest_planet_sniper(obs):
             pred_x, pred_y = predict_planet_position(
                 nearest, eta_turns, step, initial_planets, angular_velocity_map
             )
+            if segment_hits_sun(mine.x, mine.y, pred_x, pred_y):
+                continue
             # Calculate lead angle from our planet to predicted target position
             angle = math.atan2(pred_y - mine.y, pred_x - mine.x)
             moves.append([mine.id, angle, ships_needed])
