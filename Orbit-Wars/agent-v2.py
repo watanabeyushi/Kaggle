@@ -121,12 +121,18 @@ class Predictor:
             SUN_Y + orbit_radius * math.sin(future_angle),
         )
 
-    def intercept(self, src, dst, ships, iters=6):
+    def discrete_intercept_turns(self, src, dst, ships, max_turns=50):
         speed = fleet_speed(ships)
-        tx, ty = dst.x, dst.y
-        for _ in range(iters):
+        for turns in range(1, max_turns + 1):
+            tx, ty = self.future_pos(dst, turns - 1)
             dist = math.hypot(tx - src.x, ty - src.y)
-            tx, ty = self.future_pos(dst, max(1, int(dist / speed)))
+            if dist <= speed * turns:
+                return turns, tx, ty
+        tx, ty = self.future_pos(dst, max_turns - 1)
+        return max_turns, tx, ty
+
+    def intercept(self, src, dst, ships, iters=6):
+        _, tx, ty = self.discrete_intercept_turns(src, dst, ships)
         return tx, ty
 
     def aim(self, src, dst, ships):
@@ -136,9 +142,8 @@ class Predictor:
         return src.angle_xy(tx, ty)
 
     def eta(self, src, dst, ships):
-        tx, ty = self.intercept(src, dst, ships)
-        dist = math.hypot(tx - src.x, ty - src.y)
-        return max(1, int(dist / fleet_speed(ships)))
+        turns, _, _ = self.discrete_intercept_turns(src, dst, ships)
+        return turns
 
     def safe_aim(self, src, dst, ships):
         angle = self.aim(src, dst, ships)
@@ -165,9 +170,9 @@ class FleetInterceptor:
     def find_window(self, fleet, src, our_ships):
         our_speed = fleet_speed(our_ships)
         for turns in range(1, 50):
-            fx, fy = self.fleet_at(fleet, turns)
+            fx, fy = self.fleet_at(fleet, turns - 1)
             dist = math.hypot(fx - src.x, fy - src.y)
-            if abs(dist / our_speed - turns) < 1.5:
+            if dist <= our_speed * turns:
                 return fx, fy, turns
         return None
 

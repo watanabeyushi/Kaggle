@@ -14,6 +14,12 @@ AIM_ITERATIONS = 3
 DEFAULT_MAX_SPEED = 6.0
 MAX_FRONTLINE_PLANETS = 3
 STRICT_VALIDATION_THRESHOLD = 40.0
+EARLY_GAME_TURNS = 40
+MAX_WAIT_TURNS = 4
+WAIT_ADVANTAGE_MARGIN = 0.75
+GATEWAY_SAMPLE_TURNS = (2, 3, 5, 8, 12, 18)
+GATEWAY_LONG_SAMPLE_TURNS = (24, 32, 48, 64)
+SPEED_THRESHOLD_LEVELS = (1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0)
 
 
 def _obs_get(obs, key, default=None):
@@ -103,6 +109,10 @@ def is_in_bounds(x, y):
     return BOARD_MIN <= x <= BOARD_MAX and BOARD_MIN <= y <= BOARD_MAX
 
 
+def clamp(value, lower, upper):
+    return max(lower, min(upper, value))
+
+
 def fleet_position_after_time(launch_x, launch_y, angle, num_ships, time_elapsed):
     speed = estimate_fleet_speed(num_ships)
     return (
@@ -126,85 +136,77 @@ def estimate_eta_turns(src_x, src_y, dst_x, dst_y, num_ships):
     return max(1, int(math.ceil(distance / max(speed, 1e-9))))
 
 
+def max_intercept_turns(num_ships):
+    speed = estimate_fleet_speed(num_ships)
+    board_diagonal = math.hypot(BOARD_MAX - BOARD_MIN, BOARD_MAX - BOARD_MIN)
+    return max(1, int(math.ceil(board_diagonal / max(speed, 1e-9))) + 2)
+
+
+def solution_path_endpoint(solution, num_ships):
+    speed = estimate_fleet_speed(num_ships)
+    travel_time = max(0.0, float(solution["time"]))
+    return (
+        float(solution["launch_x"]) + math.cos(float(solution["angle"])) * speed * travel_time,
+        float(solution["launch_y"]) + math.sin(float(solution["angle"])) * speed * travel_time,
+    )
+
+
 def estimate_precise_intercept(
     source, target, num_ships, step, initial_planets, angular_velocity_map, validation_mode="strict"
 ):
-    speed = estimate_fleet_speed(num_ships)
-    time_to_hit = max(0.0, math.hypot(target.x - source.x, target.y - source.y) / max(speed, 1e-9))
-    angle = math.atan2(target.y - source.y, target.x - source.x)
-    launch_x, launch_y = launch_point(source, angle)
-    pred_x, pred_y = target.x, target.y
+    best_solution = None
+    best_key = None
 
-    for _ in range(AIM_ITERATIONS):
+    for turn in range(1, max_intercept_turns(num_ships) + 1):
         pred_x, pred_y = predict_planet_position(
-            target, time_to_hit, step, initial_planets, angular_velocity_map
+            target, turn - 1, step, initial_planets, angular_velocity_map
         )
         angle = math.atan2(pred_y - source.y, pred_x - source.x)
-        launch_x, launch_y = launch_point(source, angle)
-        time_to_hit = math.hypot(pred_x - launch_x, pred_y - launch_y) / max(speed, 1e-9)
-
-    eta_turns = max(1, int(math.ceil(time_to_hit)))
-    sweep_start_x, sweep_start_y = predict_planet_position(
-        target, max(0.0, eta_turns - 1), step, initial_planets, angular_velocity_map
-    )
-    sweep_end_x, sweep_end_y = predict_planet_position(
-        target, eta_turns, step, initial_planets, angular_velocity_map
-    )
-    sweep_aim_x, sweep_aim_y = closest_point_on_segment(
-        pred_x, pred_y, sweep_start_x, sweep_start_y, sweep_end_x, sweep_end_y
-    )
-    direct_angle = angle
-    direct_validation = validate_intercept_solution(
-        source,
-        target,
-        num_ships,
-        direct_angle,
-        step,
-        initial_planets,
-        angular_velocity_map,
-        max_turns=max(1, eta_turns + 2),
-        validation_mode=validation_mode,
-    )
-
-    sweep_validation = None
-    sweep_motion = math.hypot(sweep_end_x - sweep_start_x, sweep_end_y - sweep_start_y)
-    if sweep_motion > 1e-6:
-        sweep_angle = math.atan2(sweep_aim_y - source.y, sweep_aim_x - source.x)
-        sweep_validation = validate_intercept_solution(
+        solution = validate_intercept_solution(
             source,
             target,
             num_ships,
-            sweep_angle,
+            angle,
             step,
             initial_planets,
             angular_velocity_map,
-            max_turns=max(1, eta_turns + 2),
+            max_turns=turn,
             validation_mode=validation_mode,
         )
+        if solution is None:
+            continue
+        candidate_key = (
+            int(solution["eta"]),
+            float(solution["time"]),
+            abs(int(solution["eta"]) - turn),
+        )
+        if best_solution is None or candidate_key < best_key:
+            best_solution = solution
+            best_key = candidate_key
 
-    if direct_validation is not None and (
-        sweep_validation is None or direct_validation["time"] <= sweep_validation["time"]
-    ):
-        return direct_validation
-    if sweep_validation is not None:
-        return sweep_validation
+    if best_solution is not None:
+        return best_solution
 
+    fallback_turn = max(1, estimate_eta_turns(source.x, source.y, target.x, target.y, num_ships))
+    pred_x, pred_y = predict_planet_position(
+        target, fallback_turn - 1, step, initial_planets, angular_velocity_map
+    )
+    angle = math.atan2(pred_y - source.y, pred_x - source.x)
+    launch_x, launch_y = launch_point(source, angle)
+    speed = estimate_fleet_speed(num_ships)
+    time_to_hit = math.hypot(pred_x - launch_x, pred_y - launch_y) / max(speed, 1e-9)
     return {
         "valid": False,
         "time": float(time_to_hit),
-        "eta": int(max(1, math.ceil(time_to_hit))),
+        "eta": int(fallback_turn),
         "pred_x": float(pred_x),
         "pred_y": float(pred_y),
         "aim_x": float(pred_x),
         "aim_y": float(pred_y),
         "launch_x": float(launch_x),
         "launch_y": float(launch_y),
-        "angle": float(direct_angle),
+        "angle": float(angle),
         "uses_sweep": False,
-        "sweep_start_x": float(sweep_start_x),
-        "sweep_start_y": float(sweep_start_y),
-        "sweep_end_x": float(sweep_end_x),
-        "sweep_end_y": float(sweep_end_y),
     }
 
 
@@ -230,9 +232,6 @@ def validate_intercept_solution(
         target_before_x, target_before_y = predict_planet_position(
             target, turn - 1, step, initial_planets, angular_velocity_map
         )
-        target_after_x, target_after_y = predict_planet_position(
-            target, turn, step, initial_planets, angular_velocity_map
-        )
 
         hit_distance = ray_circle_hit_distance(
             prev_x, prev_y, dir_x, dir_y, target_before_x, target_before_y, target.radius
@@ -252,59 +251,6 @@ def validate_intercept_solution(
                 "launch_y": float(launch_y),
                 "angle": float(angle),
                 "uses_sweep": False,
-                "sweep_start_x": float(target_before_x),
-                "sweep_start_y": float(target_before_y),
-                "sweep_end_x": float(target_after_x),
-                "sweep_end_y": float(target_after_y),
-            }
-
-        if validation_mode == "relaxed":
-            relaxed_hit_distance = ray_circle_hit_distance(
-                prev_x, prev_y, dir_x, dir_y, target_after_x, target_after_y, target.radius
-            )
-            if relaxed_hit_distance is not None and relaxed_hit_distance <= speed + 1e-6:
-                hit_x = prev_x + dir_x * relaxed_hit_distance
-                hit_y = prev_y + dir_y * relaxed_hit_distance
-                return {
-                    "valid": True,
-                    "time": float(turn - 1 + (relaxed_hit_distance / max(speed, 1e-9))),
-                    "eta": int(turn),
-                    "pred_x": float(target_after_x),
-                    "pred_y": float(target_after_y),
-                    "aim_x": float(hit_x),
-                    "aim_y": float(hit_y),
-                    "launch_x": float(launch_x),
-                    "launch_y": float(launch_y),
-                    "angle": float(angle),
-                    "uses_sweep": False,
-                    "sweep_start_x": float(target_before_x),
-                    "sweep_start_y": float(target_before_y),
-                    "sweep_end_x": float(target_after_x),
-                    "sweep_end_y": float(target_after_y),
-                }
-
-        if point_to_segment_distance(
-            curr_x, curr_y, target_before_x, target_before_y, target_after_x, target_after_y
-        ) <= target.radius + 1e-6:
-            sweep_hit_x, sweep_hit_y = closest_point_on_segment(
-                curr_x, curr_y, target_before_x, target_before_y, target_after_x, target_after_y
-            )
-            return {
-                "valid": True,
-                "time": float(turn),
-                "eta": int(turn),
-                "pred_x": float(target_after_x),
-                "pred_y": float(target_after_y),
-                "aim_x": float(sweep_hit_x),
-                "aim_y": float(sweep_hit_y),
-                "launch_x": float(launch_x),
-                "launch_y": float(launch_y),
-                "angle": float(angle),
-                "uses_sweep": True,
-                "sweep_start_x": float(target_before_x),
-                "sweep_start_y": float(target_before_y),
-                "sweep_end_x": float(target_after_x),
-                "sweep_end_y": float(target_after_y),
             }
 
         if not is_in_bounds(curr_x, curr_y):
@@ -327,29 +273,27 @@ def infer_fleet_target_and_eta(fleet, planets, step, initial_planets, angular_ve
     dir_x = math.cos(fleet.angle)
     dir_y = math.sin(fleet.angle)
     speed = estimate_fleet_speed(fleet.ships)
+    max_turns = max(1, int(math.ceil(math.hypot(BOARD_MAX, BOARD_MAX) / max(speed, 1e-9))) + 2)
 
     for planet in planets:
-        eta_time = math.hypot(planet.x - fleet.x, planet.y - fleet.y) / max(speed, 1e-9)
-        hit_distance = None
-
-        for _ in range(AIM_ITERATIONS):
+        prev_x, prev_y = float(fleet.x), float(fleet.y)
+        for turn in range(1, max_turns + 1):
             pred_x, pred_y = predict_planet_position(
-                planet, eta_time, step, initial_planets, angular_velocity_map
+                planet, turn - 1, step, initial_planets, angular_velocity_map
             )
             hit_distance = ray_circle_hit_distance(
-                fleet.x, fleet.y, dir_x, dir_y, pred_x, pred_y, planet.radius
+                prev_x, prev_y, dir_x, dir_y, pred_x, pred_y, planet.radius
             )
-            if hit_distance is None:
+            if hit_distance is not None and hit_distance <= speed + 1e-6:
+                if best_eta is None or turn < best_eta:
+                    best_eta = turn
+                    best_planet = planet
                 break
-            eta_time = hit_distance / max(speed, 1e-9)
-
-        if hit_distance is None:
-            continue
-
-        eta_turns = max(1, int(math.ceil(eta_time)))
-        if best_eta is None or eta_turns < best_eta:
-            best_eta = eta_turns
-            best_planet = planet
+            curr_x = float(fleet.x) + dir_x * speed * turn
+            curr_y = float(fleet.y) + dir_y * speed * turn
+            if not is_in_bounds(curr_x, curr_y):
+                break
+            prev_x, prev_y = curr_x, curr_y
 
     return best_planet, best_eta
 
@@ -411,10 +355,7 @@ def compute_validation_pressure(target, ships_needed, eta_turns):
 
 
 def choose_validation_mode(target, ships_needed, eta_turns, candidate_type):
-    if candidate_type == "supply":
-        return "relaxed"
-    pressure = compute_validation_pressure(target, ships_needed, eta_turns)
-    return "strict" if pressure >= STRICT_VALIDATION_THRESHOLD else "relaxed"
+    return "strict"
 
 
 def segment_hits_sun(src_x, src_y, dst_x, dst_y, sun_x=SUN_X, sun_y=SUN_Y, sun_radius=SUN_RADIUS):
@@ -431,6 +372,446 @@ def segment_hits_sun(src_x, src_y, dst_x, dst_y, sun_x=SUN_X, sun_y=SUN_Y, sun_r
     return math.hypot(closest_x - sun_x, closest_y - sun_y) <= sun_radius
 
 
+def make_planet_proxy(planet, x, y, ships=None):
+    return type(
+        "PlanetProxy",
+        (),
+        {
+            "id": int(planet.id),
+            "owner": int(planet.owner),
+            "x": float(x),
+            "y": float(y),
+            "radius": float(planet.radius),
+            "ships": int(planet.ships if ships is None else ships),
+            "production": int(planet.production),
+        },
+    )()
+
+
+def predicted_distance_between_planets(planet_a, planet_b, future_turns, board_state):
+    ax, ay = predict_planet_position(
+        planet_a,
+        future_turns,
+        board_state["step"],
+        board_state["initial_planets"],
+        board_state["angular_velocity_map"],
+    )
+    bx, by = predict_planet_position(
+        planet_b,
+        future_turns,
+        board_state["step"],
+        board_state["initial_planets"],
+        board_state["angular_velocity_map"],
+    )
+    return math.hypot(ax - bx, ay - by)
+
+
+def nearest_predicted_distance_to_group(target, planets, future_turns, board_state, exclude_ids=None):
+    exclude_ids = set() if exclude_ids is None else set(exclude_ids)
+    distances = [
+        predicted_distance_between_planets(target, planet, future_turns, board_state)
+        for planet in planets
+        if planet.id not in exclude_ids and planet.id != target.id
+    ]
+    if not distances:
+        return float("inf")
+    return min(distances)
+
+
+def local_cluster_stats(target, board_state, future_turns=0):
+    distances = []
+    for planet in board_state["targets"]:
+        if planet.id == target.id:
+            continue
+        distances.append(predicted_distance_between_planets(target, planet, future_turns, board_state))
+    if not distances:
+        return {"nearby_count": 0, "avg_distance": BOARD_MAX, "spread_score": 0.0}
+    distances.sort()
+    local_distances = distances[:4]
+    avg_distance = sum(local_distances) / len(local_distances)
+    nearby_count = sum(1 for distance in local_distances if distance <= 22.0)
+    spread_score = 1.0 / (1.0 + avg_distance / 18.0)
+    return {
+        "nearby_count": int(nearby_count),
+        "avg_distance": float(avg_distance),
+        "spread_score": float(spread_score),
+    }
+
+
+def tempo_multiplier(eta_turns, step):
+    eta_turns = max(1.0, float(eta_turns))
+    early_pressure = 1.0 + clamp((EARLY_GAME_TURNS - float(step)) / EARLY_GAME_TURNS, 0.0, 1.0) * 0.9
+    horizon = max(6.0, 16.0 / early_pressure)
+    return 1.0 / (1.0 + eta_turns / horizon)
+
+
+def gateway_sample_turns(step):
+    samples = list(GATEWAY_SAMPLE_TURNS)
+    if int(step) < EARLY_GAME_TURNS:
+        samples.extend(GATEWAY_LONG_SAMPLE_TURNS[:2])
+    elif int(step) < EARLY_GAME_TURNS * 2:
+        samples.append(GATEWAY_LONG_SAMPLE_TURNS[0])
+    return tuple(samples)
+
+
+def best_gateway_followup(target, future_turns, board_state, exclude_ids=None):
+    exclude_ids = set() if exclude_ids is None else set(exclude_ids)
+    tx, ty = predict_planet_position(
+        target,
+        future_turns,
+        board_state["step"],
+        board_state["initial_planets"],
+        board_state["angular_velocity_map"],
+    )
+    best_planet = None
+    best_score = 0.0
+    followup_turns = max(0, int(future_turns))
+    future_window = max(0.0, EARLY_GAME_TURNS - float(board_state["step"] + followup_turns))
+    for planet in board_state["targets"]:
+        if planet.id == target.id or planet.id in exclude_ids:
+            continue
+        px, py = predict_planet_position(
+            planet,
+            future_turns,
+            board_state["step"],
+            board_state["initial_planets"],
+            board_state["angular_velocity_map"],
+        )
+        distance = math.hypot(tx - px, ty - py)
+        production = max(1.0, float(planet.production))
+        score = production * (1.0 + future_window / 60.0) / (1.0 + distance / 18.0)
+        if int(planet.owner) != -1:
+            score *= 1.1
+        if score > best_score:
+            best_score = score
+            best_planet = planet
+    return best_planet, best_score
+
+
+def gateway_bonus(target, eta_turns, board_state):
+    sample_scores = []
+    for sample_turn in gateway_sample_turns(board_state["step"]):
+        _, followup_score = best_gateway_followup(
+            target, max(1, int(eta_turns) + int(sample_turn)), board_state
+        )
+        if followup_score > 0.0:
+            sample_scores.append(followup_score)
+    if not sample_scores:
+        return 0.0
+    best_scores = sorted(sample_scores, reverse=True)[:3]
+    return sum(best_scores) / max(1.0, 8.0 * len(best_scores))
+
+
+def gateway_branch_score(target, eta_turns, board_state):
+    branch_scores = []
+    for sample_turn in gateway_sample_turns(board_state["step"])[:4]:
+        followup_turn = max(1, int(eta_turns) + int(sample_turn))
+        first_planet, first_score = best_gateway_followup(target, followup_turn, board_state)
+        if first_planet is None or first_score <= 0.0:
+            continue
+        _, second_score = best_gateway_followup(
+            first_planet,
+            followup_turn + max(2, int(sample_turn) // 2),
+            board_state,
+            exclude_ids={target.id, first_planet.id},
+        )
+        branch_scores.append(first_score * 0.35 + second_score * 0.18)
+    if not branch_scores:
+        return 0.0
+    return max(branch_scores) / 8.0
+
+
+def target_value(target, eta_turns, board_state, mission_type="attack"):
+    eta_turns = max(1, int(math.ceil(eta_turns)))
+    base_production = max(1.0, float(target.production))
+    future_window = max(0.0, EARLY_GAME_TURNS - float(board_state["step"] + eta_turns))
+    production_value = base_production * (1.0 + future_window / 18.0)
+    tempo_value = tempo_multiplier(eta_turns, board_state["step"])
+    cluster = local_cluster_stats(target, board_state, future_turns=eta_turns)
+    cluster_multiplier = 1.0 + 0.18 * cluster["nearby_count"] + 0.55 * cluster["spread_score"]
+    enemy_distance = nearest_predicted_distance_to_group(
+        target, board_state["enemy_planets"], eta_turns, board_state
+    )
+    gateway_multiplier = 1.0 + 0.25 * gateway_bonus(target, eta_turns, board_state)
+    gateway_multiplier += 0.12 * gateway_branch_score(target, eta_turns, board_state)
+
+    if mission_type == "supply":
+        frontline_pressure = 1.0 / max(8.0, enemy_distance)
+        owned_multiplier = 1.0 + frontline_pressure * 6.0
+        return production_value * (0.7 + tempo_value * 0.6) * cluster_multiplier * owned_multiplier
+
+    my_distance = nearest_predicted_distance_to_group(
+        target, board_state["my_planets"], eta_turns, board_state
+    )
+    neutral_distance = nearest_predicted_distance_to_group(
+        target, board_state["neutral_planets"], eta_turns, board_state, exclude_ids={target.id}
+    )
+    competition_multiplier = clamp((enemy_distance + 8.0) / (my_distance + 8.0), 0.75, 1.35)
+    neutral_multiplier = 1.0
+    if int(target.owner) == -1 and not math.isinf(neutral_distance):
+        neutral_multiplier += 0.25 / (1.0 + neutral_distance / 18.0)
+    owner_multiplier = 1.12 if int(target.owner) != -1 else 1.0
+    return (
+        production_value
+        * tempo_value
+        * cluster_multiplier
+        * competition_multiplier
+        * neutral_multiplier
+        * owner_multiplier
+        * gateway_multiplier
+    )
+
+
+def source_optionality_cost(source, ships_to_send, available_to_send, board_state):
+    available_to_send = max(1.0, float(available_to_send))
+    commit_ratio = clamp(float(ships_to_send) / available_to_send, 0.0, 1.5)
+    frontline_distance = min_distance_to_targets(source, board_state["targets"])
+    frontline_pressure = 14.0 / max(14.0, frontline_distance + 4.0)
+    early_factor = 0.6 + clamp(
+        (EARLY_GAME_TURNS - float(board_state["step"])) / EARLY_GAME_TURNS, 0.0, 1.0
+    ) * 0.8
+    scarcity_factor = 2.5 / max(2.0, float(len(board_state["my_planets"])))
+    production_factor = max(1.0, float(source.production)) / 12.0
+    reserve_ratio = max(0.0, (available_to_send - float(ships_to_send)) / available_to_send)
+    flexibility_penalty = commit_ratio * (
+        0.05 + 0.08 * frontline_pressure + 0.05 * scarcity_factor + 0.04 * production_factor
+    )
+    return flexibility_penalty * early_factor * (1.0 - 0.35 * reserve_ratio)
+
+
+def target_stability_cost(target, eta_turns, board_state, mission_type="attack"):
+    eta_turns = max(1.0, float(eta_turns))
+    early_factor = 1.0 + clamp(
+        (EARLY_GAME_TURNS - float(board_state["step"])) / EARLY_GAME_TURNS, 0.0, 1.0
+    ) * 0.8
+    my_distance = nearest_predicted_distance_to_group(
+        target, board_state["my_planets"], eta_turns, board_state
+    )
+    enemy_distance = nearest_predicted_distance_to_group(
+        target, board_state["enemy_planets"], eta_turns, board_state
+    )
+    if math.isinf(enemy_distance):
+        enemy_distance = BOARD_MAX
+    competition_penalty = max(0.0, (my_distance - enemy_distance) / 50.0)
+    frontline_penalty = (12.0 / max(12.0, enemy_distance + 2.0)) * 0.08
+    eta_penalty = min(0.12, eta_turns / 80.0)
+    owner_penalty = 0.05 if int(target.owner) != -1 and mission_type != "supply" else 0.0
+    if mission_type == "supply":
+        competition_penalty *= 0.5
+        frontline_penalty *= 0.6
+    return (competition_penalty + frontline_penalty + eta_penalty + owner_penalty) * early_factor
+
+
+def mission_score(
+    source,
+    target,
+    ships_to_send,
+    eta_turns,
+    solution_time,
+    available_to_send,
+    board_state,
+    mission_type="attack",
+    opportunity_multiplier=1.0,
+):
+    value = target_value(target, eta_turns, board_state, mission_type=mission_type)
+    value *= max(0.1, float(opportunity_multiplier))
+    production_scale = max(6.0, max(1.0, float(target.production)) * 3.0)
+    effective_cost = max(1.0, float(solution_time)) * (0.6 + float(ships_to_send) / production_scale)
+    base_score = value / effective_cost
+    source_cost = source_optionality_cost(source, ships_to_send, available_to_send, board_state)
+    stability_cost = target_stability_cost(target, eta_turns, board_state, mission_type=mission_type)
+    if mission_type == "supply":
+        source_cost *= 0.75
+        stability_cost *= 0.6
+    return base_score - source_cost - stability_cost
+
+
+def estimate_required_ships_for_speed(target_speed, max_speed=DEFAULT_MAX_SPEED):
+    target_speed = clamp(float(target_speed), 1.0, float(max_speed))
+    if target_speed <= 1.0 + 1e-9 or max_speed <= 1.0 + 1e-9:
+        return 1
+    ratio = (target_speed - 1.0) / (float(max_speed) - 1.0)
+    ratio = clamp(ratio, 0.0, 1.0)
+    exponent = ratio ** (2.0 / 3.0)
+    return max(1, int(math.ceil(math.exp(math.log(1000) * exponent))))
+
+
+def speed_threshold_options(min_ships, max_ships, source_production=0):
+    min_ships = max(1, int(min_ships))
+    max_ships = max(min_ships, int(max_ships))
+    options = {min_ships, max_ships}
+    growth_step = max(1, int(source_production))
+    for multiplier in range(1, 4):
+        options.add(min(max_ships, min_ships + growth_step * multiplier))
+    for target_speed in SPEED_THRESHOLD_LEVELS:
+        ships = estimate_required_ships_for_speed(target_speed)
+        if min_ships <= ships <= max_ships:
+            options.add(ships)
+    return sorted(options)
+
+
+def evaluate_regular_attack_option(
+    source,
+    target,
+    ships_to_send,
+    wait_turns,
+    step,
+    initial_planets,
+    angular_velocity_map,
+    friendly_arrivals_by_target,
+    planned_arrivals_by_target,
+    board_state,
+):
+    available_after_wait = get_available_to_send(source) + int(source.production) * int(wait_turns)
+    ships_to_send = int(ships_to_send)
+    if ships_to_send <= 0 or ships_to_send > available_after_wait:
+        return None
+
+    future_source_x, future_source_y = predict_planet_position(
+        source, wait_turns, step, initial_planets, angular_velocity_map
+    )
+    future_source = make_planet_proxy(
+        source,
+        future_source_x,
+        future_source_y,
+        ships=int(source.ships) + int(source.production) * int(wait_turns),
+    )
+    future_step = int(step) + int(wait_turns)
+    initial_solution = estimate_precise_intercept(
+        future_source,
+        target,
+        ships_to_send,
+        future_step,
+        initial_planets,
+        angular_velocity_map,
+    )
+    if not initial_solution or not initial_solution.get("valid", False):
+        return None
+
+    total_eta = int(wait_turns) + int(initial_solution["eta"])
+    ships_needed = compute_attack_need(
+        target, total_eta, friendly_arrivals_by_target, planned_arrivals_by_target
+    )
+    if ships_needed <= 0 or ships_needed > ships_to_send:
+        return None
+
+    validation_mode = choose_validation_mode(target, ships_to_send, total_eta, "roi")
+    solution = estimate_precise_intercept(
+        future_source,
+        target,
+        ships_to_send,
+        future_step,
+        initial_planets,
+        angular_velocity_map,
+        validation_mode=validation_mode,
+    )
+    if not solution or not solution.get("valid", False):
+        return None
+
+    total_eta = int(wait_turns) + int(solution["eta"])
+    ships_needed = compute_attack_need(
+        target, total_eta, friendly_arrivals_by_target, planned_arrivals_by_target
+    )
+    if ships_needed <= 0 or ships_needed > ships_to_send:
+        return None
+    path_end_x, path_end_y = solution_path_endpoint(solution, ships_to_send)
+    if segment_hits_sun(solution["launch_x"], solution["launch_y"], path_end_x, path_end_y):
+        return None
+
+    effective_time = float(wait_turns) + float(solution["time"])
+    score = mission_score(
+        source,
+        target,
+        ships_to_send,
+        total_eta,
+        effective_time,
+        available_after_wait,
+        board_state,
+        mission_type="attack",
+    )
+    return {
+        "type": "roi",
+        "source_id": int(source.id),
+        "target_id": int(target.id),
+        "ships": int(ships_to_send),
+        "ships_needed": int(ships_needed),
+        "eta": int(total_eta),
+        "angle": solution["angle"],
+        "score": score,
+        "validation_mode": validation_mode,
+        "wait_turns": int(wait_turns),
+        "effective_time": effective_time,
+    }
+
+
+def select_preferred_attack_plan(
+    source,
+    target,
+    step,
+    initial_planets,
+    angular_velocity_map,
+    friendly_arrivals_by_target,
+    planned_arrivals_by_target,
+    board_state,
+):
+    available_to_send = get_available_to_send(source)
+    if available_to_send <= 0:
+        return None
+
+    base_min_ships = max(1, int(target.ships) + 1)
+    immediate_best = None
+    overall_best = None
+    max_wait_turns = MAX_WAIT_TURNS if int(source.production) > 0 else 0
+
+    for wait_turns in range(0, max_wait_turns + 1):
+        available_after_wait = available_to_send + int(source.production) * wait_turns
+        if available_after_wait < base_min_ships:
+            continue
+        for ships_to_send in speed_threshold_options(base_min_ships, available_after_wait, source.production):
+            plan = evaluate_regular_attack_option(
+                source,
+                target,
+                ships_to_send,
+                wait_turns,
+                step,
+                initial_planets,
+                angular_velocity_map,
+                friendly_arrivals_by_target,
+                planned_arrivals_by_target,
+                board_state,
+            )
+            if plan is None:
+                continue
+            if wait_turns == 0 and (
+                immediate_best is None
+                or plan["effective_time"] < immediate_best["effective_time"] - 1e-6
+                or (
+                    abs(plan["effective_time"] - immediate_best["effective_time"]) <= 1e-6
+                    and plan["ships"] < immediate_best["ships"]
+                )
+            ):
+                immediate_best = plan
+            if (
+                overall_best is None
+                or plan["effective_time"] < overall_best["effective_time"] - 1e-6
+                or (
+                    abs(plan["effective_time"] - overall_best["effective_time"]) <= 1e-6
+                    and plan["ships"] < overall_best["ships"]
+                )
+            ):
+                overall_best = plan
+
+    if overall_best is None:
+        return None
+    if immediate_best is None:
+        return overall_best
+    if overall_best["wait_turns"] > 0 and (
+        overall_best["effective_time"] + WAIT_ADVANTAGE_MARGIN < immediate_best["effective_time"]
+    ):
+        return overall_best
+    return immediate_best
+
+
 def build_regular_attack_candidate(
     source,
     target,
@@ -439,76 +820,18 @@ def build_regular_attack_candidate(
     angular_velocity_map,
     friendly_arrivals_by_target,
     planned_arrivals_by_target,
+    board_state,
 ):
-    available_to_send = get_available_to_send(source)
-    if available_to_send <= 0:
-        return None
-
-    initial_ships_needed = max(1, int(target.ships) + 1)
-    solution = estimate_precise_intercept(
+    return select_preferred_attack_plan(
         source,
         target,
-        initial_ships_needed,
         step,
         initial_planets,
         angular_velocity_map,
-        validation_mode="relaxed",
+        friendly_arrivals_by_target,
+        planned_arrivals_by_target,
+        board_state,
     )
-    if not solution.get("valid", False):
-        return None
-    eta_turns = solution["eta"]
-    ships_needed = compute_attack_need(
-        target, eta_turns, friendly_arrivals_by_target, planned_arrivals_by_target
-    )
-    if ships_needed <= 0 or ships_needed > available_to_send:
-        return None
-    validation_mode = choose_validation_mode(target, ships_needed, eta_turns, "roi")
-
-    solution = estimate_precise_intercept(
-        source,
-        target,
-        ships_needed,
-        step,
-        initial_planets,
-        angular_velocity_map,
-        validation_mode=validation_mode,
-    )
-    if not solution.get("valid", False):
-        return None
-    eta_turns = solution["eta"]
-    ships_needed = compute_attack_need(
-        target, eta_turns, friendly_arrivals_by_target, planned_arrivals_by_target
-    )
-    if ships_needed <= 0 or ships_needed > available_to_send:
-        return None
-
-    solution = estimate_precise_intercept(
-        source,
-        target,
-        ships_needed,
-        step,
-        initial_planets,
-        angular_velocity_map,
-    )
-    if not solution.get("valid", False):
-        return None
-    eta_turns = solution["eta"]
-    if segment_hits_sun(
-        solution["launch_x"], solution["launch_y"], solution["aim_x"], solution["aim_y"]
-    ):
-        return None
-
-    roi_score = target.production / max(1.0, ships_needed * solution["time"])
-    return {
-        "type": "roi",
-        "source_id": int(source.id),
-        "target_id": int(target.id),
-        "ships": int(ships_needed),
-        "eta": int(eta_turns),
-        "angle": solution["angle"],
-        "score": roi_score,
-        "validation_mode": validation_mode,
-    }
 
 
 def resolve_arrival_event(owner, garrison, arrivals):
@@ -584,7 +907,8 @@ def build_intercept_windows(target, enemy_arrivals, player):
                 {
                     "arrival_eta": int(desired_eta),
                     "garrison": int(arrival_garrison),
-                    "score": target.production / max(1.0, arrival_garrison),
+                    "opportunity_multiplier": 1.0
+                    + (float(target.production) / max(4.0, float(arrival_garrison))),
                 }
             )
 
@@ -600,6 +924,7 @@ def build_intercept_candidate(
     angular_velocity_map,
     friendly_arrivals_by_target,
     planned_arrivals_by_target,
+    board_state,
 ):
     available_to_send = get_available_to_send(source)
     if available_to_send <= 0:
@@ -631,12 +956,21 @@ def build_intercept_candidate(
     if solution["eta"] != desired_eta:
         return None
 
-    if segment_hits_sun(
-        solution["launch_x"], solution["launch_y"], solution["aim_x"], solution["aim_y"]
-    ):
+    path_end_x, path_end_y = solution_path_endpoint(solution, ships_needed)
+    if segment_hits_sun(solution["launch_x"], solution["launch_y"], path_end_x, path_end_y):
         return None
 
-    intercept_score = window["score"] / max(1.0, ships_needed)
+    intercept_score = mission_score(
+        source,
+        target,
+        ships_needed,
+        desired_eta,
+        solution["time"],
+        available_to_send,
+        board_state,
+        mission_type="intercept",
+        opportunity_multiplier=window.get("opportunity_multiplier", 1.0),
+    )
     return {
         "type": "intercept",
         "source_id": int(source.id),
@@ -673,6 +1007,7 @@ def build_supply_candidate(
     angular_velocity_map,
     friendly_arrivals_by_target,
     planned_arrivals_by_target,
+    board_state,
 ):
     available_to_send = get_available_to_send(source)
     if available_to_send <= 0 or source.id == frontline_target.id:
@@ -686,7 +1021,6 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
-        validation_mode="relaxed",
     )
     if not solution.get("valid", False):
         return None
@@ -713,7 +1047,6 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
-        validation_mode="relaxed",
     )
     if not solution.get("valid", False):
         return None
@@ -736,18 +1069,26 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
-        validation_mode="relaxed",
     )
     if not solution.get("valid", False):
         return None
     eta_turns = solution["eta"]
-    if segment_hits_sun(
-        solution["launch_x"], solution["launch_y"], solution["aim_x"], solution["aim_y"]
-    ):
+    path_end_x, path_end_y = solution_path_endpoint(solution, ships_to_send)
+    if segment_hits_sun(solution["launch_x"], solution["launch_y"], path_end_x, path_end_y):
         return None
 
     pressure = 1.0 / max(1.0, min_distance_to_targets(frontline_target, targets))
-    score = (ships_to_send * pressure) / max(1.0, solution["time"])
+    score = mission_score(
+        source,
+        frontline_target,
+        ships_to_send,
+        eta_turns,
+        solution["time"],
+        available_to_send,
+        board_state,
+        mission_type="supply",
+        opportunity_multiplier=1.0 + pressure * 6.0,
+    )
     return {
         "type": "supply",
         "source_id": int(source.id),
@@ -756,7 +1097,7 @@ def build_supply_candidate(
         "eta": int(eta_turns),
         "angle": solution["angle"],
         "score": score,
-        "validation_mode": "relaxed",
+        "validation_mode": "strict",
     }
 
 
@@ -781,6 +1122,18 @@ def nearest_planet_sniper(obs):
     if not my_planets or not targets:
         return moves
 
+    board_state = {
+        "player": int(player),
+        "step": int(step),
+        "planets": planets,
+        "my_planets": my_planets,
+        "targets": targets,
+        "enemy_planets": [planet for planet in targets if int(planet.owner) not in (-1, int(player))],
+        "neutral_planets": [planet for planet in targets if int(planet.owner) == -1],
+        "initial_planets": initial_planets,
+        "angular_velocity_map": angular_velocity_map,
+    }
+
     arrivals_by_target = build_arrivals_by_target(
         fleets, planets, step, initial_planets, angular_velocity_map
     )
@@ -802,9 +1155,14 @@ def nearest_planet_sniper(obs):
     frontline_planets, rear_planets = classify_frontline_planets(my_planets, targets)
     planned_arrivals_by_target = defaultdict(list)
     used_source_ids = set()
+    reserved_source_ids = set()
 
     for source in sorted(my_planets, key=lambda planet: get_available_to_send(planet), reverse=True):
-        if source.id in used_source_ids or get_available_to_send(source) <= 0:
+        if (
+            source.id in used_source_ids
+            or source.id in reserved_source_ids
+            or get_available_to_send(source) <= 0
+        ):
             continue
 
         candidates = []
@@ -819,6 +1177,7 @@ def nearest_planet_sniper(obs):
                     angular_velocity_map,
                     friendly_arrivals_by_target,
                     planned_arrivals_by_target,
+                    board_state,
                 )
                 if candidate is None:
                     continue
@@ -834,7 +1193,11 @@ def nearest_planet_sniper(obs):
             used_source_ids.add(best_candidate["source_id"])
 
     for source in sorted(my_planets, key=lambda planet: get_available_to_send(planet), reverse=True):
-        if source.id in used_source_ids or get_available_to_send(source) <= 0:
+        if (
+            source.id in used_source_ids
+            or source.id in reserved_source_ids
+            or get_available_to_send(source) <= 0
+        ):
             continue
 
         candidates = []
@@ -847,6 +1210,7 @@ def nearest_planet_sniper(obs):
                 angular_velocity_map,
                 friendly_arrivals_by_target,
                 planned_arrivals_by_target,
+                board_state,
             )
             if candidate is None:
                 continue
@@ -855,6 +1219,9 @@ def nearest_planet_sniper(obs):
         ranked_candidates = rank_candidates(candidates)
         if ranked_candidates:
             best_candidate = ranked_candidates[0]
+            if best_candidate.get("wait_turns", 0) > 0:
+                reserved_source_ids.add(best_candidate["source_id"])
+                continue
             moves.append([best_candidate["source_id"], best_candidate["angle"], best_candidate["ships"]])
             planned_arrivals_by_target[best_candidate["target_id"]].append(
                 (best_candidate["eta"], best_candidate["ships"])
@@ -862,7 +1229,11 @@ def nearest_planet_sniper(obs):
             used_source_ids.add(best_candidate["source_id"])
 
     for source in sorted(rear_planets, key=lambda planet: get_available_to_send(planet), reverse=True):
-        if source.id in used_source_ids or get_available_to_send(source) <= 0:
+        if (
+            source.id in used_source_ids
+            or source.id in reserved_source_ids
+            or get_available_to_send(source) <= 0
+        ):
             continue
 
         candidates = []
@@ -876,6 +1247,7 @@ def nearest_planet_sniper(obs):
                 angular_velocity_map,
                 friendly_arrivals_by_target,
                 planned_arrivals_by_target,
+                board_state,
             )
             if candidate is None:
                 continue

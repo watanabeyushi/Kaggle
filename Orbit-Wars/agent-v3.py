@@ -257,7 +257,6 @@ def validate_intercept_solution(
     for turn in range(1, max(1, int(max_turns)) + 1):
         curr_x, curr_y = fleet_position_after_time(launch_x, launch_y, angle, num_ships, turn)
         target_before_x, target_before_y = state.predict_position(target, launch_delay + turn - 1)
-        target_after_x, target_after_y = state.predict_position(target, launch_delay + turn)
 
         hit_distance = ray_circle_hit_distance(
             prev_x,
@@ -283,55 +282,6 @@ def validate_intercept_solution(
                 "launch_y": float(launch_y),
                 "angle": float(angle),
                 "uses_sweep": False,
-                "launch_delay": int(launch_delay),
-            }
-
-        if validation_mode == "relaxed":
-            relaxed_hit_distance = ray_circle_hit_distance(
-                prev_x,
-                prev_y,
-                dir_x,
-                dir_y,
-                target_after_x,
-                target_after_y,
-                target.radius,
-            )
-            if relaxed_hit_distance is not None and relaxed_hit_distance <= speed + 1e-6:
-                hit_x = prev_x + dir_x * relaxed_hit_distance
-                hit_y = prev_y + dir_y * relaxed_hit_distance
-                return {
-                    "valid": True,
-                    "time": float(turn - 1 + (relaxed_hit_distance / max(speed, 1e-9))),
-                    "eta": int(turn),
-                    "pred_x": float(target_after_x),
-                    "pred_y": float(target_after_y),
-                    "aim_x": float(hit_x),
-                    "aim_y": float(hit_y),
-                    "launch_x": float(launch_x),
-                    "launch_y": float(launch_y),
-                    "angle": float(angle),
-                    "uses_sweep": False,
-                    "launch_delay": int(launch_delay),
-                }
-
-        if point_to_segment_distance(
-            curr_x, curr_y, target_before_x, target_before_y, target_after_x, target_after_y
-        ) <= target.radius + 1e-6:
-            sweep_hit_x, sweep_hit_y = closest_point_on_segment(
-                curr_x, curr_y, target_before_x, target_before_y, target_after_x, target_after_y
-            )
-            return {
-                "valid": True,
-                "time": float(turn),
-                "eta": int(turn),
-                "pred_x": float(target_after_x),
-                "pred_y": float(target_after_y),
-                "aim_x": float(sweep_hit_x),
-                "aim_y": float(sweep_hit_y),
-                "launch_x": float(launch_x),
-                "launch_y": float(launch_y),
-                "angle": float(angle),
-                "uses_sweep": True,
                 "launch_delay": int(launch_delay),
             }
 
@@ -377,32 +327,8 @@ def estimate_precise_intercept(
         validation_mode=validation_mode,
     )
 
-    sweep_validation = None
-    sweep_start_x, sweep_start_y = state.predict_position(target, launch_delay + max(0.0, eta_turns - 1))
-    sweep_end_x, sweep_end_y = state.predict_position(target, launch_delay + eta_turns)
-    sweep_motion = math.hypot(sweep_end_x - sweep_start_x, sweep_end_y - sweep_start_y)
-    if sweep_motion > 1e-6:
-        sweep_aim_x, sweep_aim_y = closest_point_on_segment(
-            pred_x, pred_y, sweep_start_x, sweep_start_y, sweep_end_x, sweep_end_y
-        )
-        sweep_angle = math.atan2(sweep_aim_y - source_body.y, sweep_aim_x - source_body.x)
-        sweep_validation = validate_intercept_solution(
-            state,
-            source,
-            target,
-            num_ships,
-            sweep_angle,
-            launch_delay,
-            max_turns=max(1, eta_turns + 2),
-            validation_mode=validation_mode,
-        )
-
-    if direct_validation is not None and (
-        sweep_validation is None or direct_validation["time"] <= sweep_validation["time"]
-    ):
+    if direct_validation is not None:
         return direct_validation
-    if sweep_validation is not None:
-        return sweep_validation
 
     return {
         "valid": False,
@@ -426,27 +352,25 @@ def infer_fleet_target_and_eta(state, fleet):
     dir_x = math.cos(fleet.angle)
     dir_y = math.sin(fleet.angle)
     speed = estimate_fleet_speed(fleet.ships)
+    max_turns = max(1, int(math.ceil(math.hypot(BOARD_MAX, BOARD_MAX) / max(speed, 1e-9))) + 2)
 
     for planet in state.planets:
-        eta_time = math.hypot(planet.x - fleet.x, planet.y - fleet.y) / max(speed, 1e-9)
-        hit_distance = None
-
-        for _ in range(AIM_ITERATIONS):
-            pred_x, pred_y = state.predict_position(planet, eta_time)
+        prev_x, prev_y = float(fleet.x), float(fleet.y)
+        for turn in range(1, max_turns + 1):
+            pred_x, pred_y = state.predict_position(planet, turn - 1)
             hit_distance = ray_circle_hit_distance(
-                fleet.x, fleet.y, dir_x, dir_y, pred_x, pred_y, planet.radius
+                prev_x, prev_y, dir_x, dir_y, pred_x, pred_y, planet.radius
             )
-            if hit_distance is None:
+            if hit_distance is not None and hit_distance <= speed + 1e-6:
+                if best_eta is None or turn < best_eta:
+                    best_eta = turn
+                    best_planet = planet
                 break
-            eta_time = hit_distance / max(speed, 1e-9)
-
-        if hit_distance is None:
-            continue
-
-        eta_turns = max(1, int(math.ceil(eta_time)))
-        if best_eta is None or eta_turns < best_eta:
-            best_eta = eta_turns
-            best_planet = planet
+            curr_x = float(fleet.x) + dir_x * speed * turn
+            curr_y = float(fleet.y) + dir_y * speed * turn
+            if not is_in_bounds(curr_x, curr_y):
+                break
+            prev_x, prev_y = curr_x, curr_y
 
     return best_planet, best_eta
 
