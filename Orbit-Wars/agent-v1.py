@@ -20,6 +20,11 @@ WAIT_ADVANTAGE_MARGIN = 0.75
 GATEWAY_SAMPLE_TURNS = (2, 3, 5, 8, 12, 18)
 GATEWAY_LONG_SAMPLE_TURNS = (24, 32, 48, 64)
 SPEED_THRESHOLD_LEVELS = (1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0)
+INTERCEPT_SEARCH_RADIUS = 2
+INTERCEPT_SEARCH_EXPANSION = 6
+MAX_SPEED_OPTION_CANDIDATES = 5
+MAX_REGULAR_TARGETS = 6
+MAX_ROUGH_ATTACK_ETA = 28
 
 
 def _obs_get(obs, key, default=None):
@@ -113,6 +118,35 @@ def clamp(value, lower, upper):
     return max(lower, min(upper, value))
 
 
+def solve_launch_solution(
+    source,
+    target_x,
+    target_y,
+    num_ships,
+    step,
+    initial_planets,
+    angular_velocity_map,
+    iterations=AIM_ITERATIONS,
+):
+    speed = estimate_fleet_speed(num_ships)
+    angle = math.atan2(target_y - source.y, target_x - source.x)
+
+    for _ in range(max(1, int(iterations))):
+        launch_x, launch_y = launch_point(source, angle)
+        angle = math.atan2(float(target_y) - float(launch_y), float(target_x) - float(launch_x))
+
+    launch_x, launch_y = launch_point(source, angle)
+    travel_time = math.hypot(float(target_x) - float(launch_x), float(target_y) - float(launch_y)) / max(
+        speed, 1e-9
+    )
+    return {
+        "angle": float(angle),
+        "time": float(travel_time),
+        "launch_x": float(launch_x),
+        "launch_y": float(launch_y),
+    }
+
+
 def fleet_position_after_time(launch_x, launch_y, angle, num_ships, time_elapsed):
     speed = estimate_fleet_speed(num_ships)
     return (
@@ -142,6 +176,44 @@ def max_intercept_turns(num_ships):
     return max(1, int(math.ceil(board_diagonal / max(speed, 1e-9))) + 2)
 
 
+def candidate_intercept_turns(source, target, num_ships, step, initial_planets, angular_velocity_map):
+    max_turns = max_intercept_turns(num_ships)
+    base_solution = solve_launch_solution(
+        source, target.x, target.y, num_ships, step, initial_planets, angular_velocity_map, iterations=1
+    )
+    if base_solution is None:
+        base_eta = estimate_eta_turns(source.x, source.y, target.x, target.y, num_ships)
+    else:
+        base_eta = max(1, int(math.ceil(base_solution["time"])))
+    pred_x, pred_y = predict_planet_position(
+        target, max(0, base_eta - 1), step, initial_planets, angular_velocity_map
+    )
+    solved = solve_launch_solution(
+        source, pred_x, pred_y, num_ships, step, initial_planets, angular_velocity_map, iterations=1
+    )
+    if solved is None:
+        refined_eta = estimate_eta_turns(source.x, source.y, pred_x, pred_y, num_ships)
+    else:
+        refined_eta = max(1, int(math.ceil(solved["time"])))
+    seeds = {max(1, base_eta), max(1, refined_eta)}
+    candidates = set()
+    for seed in seeds:
+        for delta in range(-INTERCEPT_SEARCH_RADIUS, INTERCEPT_SEARCH_RADIUS + 1):
+            turn = seed + delta
+            if 1 <= turn <= max_turns:
+                candidates.add(turn)
+        for delta in range(INTERCEPT_SEARCH_RADIUS + 1, INTERCEPT_SEARCH_EXPANSION + 1, 2):
+            low_turn = seed - delta
+            high_turn = seed + delta
+            if 1 <= low_turn <= max_turns:
+                candidates.add(low_turn)
+            if 1 <= high_turn <= max_turns:
+                candidates.add(high_turn)
+    if not candidates:
+        return [max(1, min(max_turns, base_eta))]
+    return sorted(candidates)
+
+
 def solution_path_endpoint(solution, num_ships):
     speed = estimate_fleet_speed(num_ships)
     travel_time = max(0.0, float(solution["time"]))
@@ -157,16 +229,22 @@ def estimate_precise_intercept(
     best_solution = None
     best_key = None
 
-    for turn in range(1, max_intercept_turns(num_ships) + 1):
+    for turn in candidate_intercept_turns(
+        source, target, num_ships, step, initial_planets, angular_velocity_map
+    ):
         pred_x, pred_y = predict_planet_position(
             target, turn - 1, step, initial_planets, angular_velocity_map
         )
-        angle = math.atan2(pred_y - source.y, pred_x - source.x)
+        launch_solution = solve_launch_solution(
+            source, pred_x, pred_y, num_ships, step, initial_planets, angular_velocity_map
+        )
+        if launch_solution is None:
+            continue
         solution = validate_intercept_solution(
             source,
             target,
             num_ships,
-            angle,
+            launch_solution["angle"],
             step,
             initial_planets,
             angular_velocity_map,
@@ -187,14 +265,29 @@ def estimate_precise_intercept(
     if best_solution is not None:
         return best_solution
 
-    fallback_turn = max(1, estimate_eta_turns(source.x, source.y, target.x, target.y, num_ships))
+    fallback_solution = solve_launch_solution(
+        source, target.x, target.y, num_ships, step, initial_planets, angular_velocity_map, iterations=1
+    )
+    if fallback_solution is None:
+        fallback_turn = max(1, estimate_eta_turns(source.x, source.y, target.x, target.y, num_ships))
+    else:
+        fallback_turn = max(1, int(math.ceil(fallback_solution["time"])))
     pred_x, pred_y = predict_planet_position(
         target, fallback_turn - 1, step, initial_planets, angular_velocity_map
     )
-    angle = math.atan2(pred_y - source.y, pred_x - source.x)
-    launch_x, launch_y = launch_point(source, angle)
-    speed = estimate_fleet_speed(num_ships)
-    time_to_hit = math.hypot(pred_x - launch_x, pred_y - launch_y) / max(speed, 1e-9)
+    launch_solution = solve_launch_solution(
+        source, pred_x, pred_y, num_ships, step, initial_planets, angular_velocity_map
+    )
+    if launch_solution is None:
+        angle = math.atan2(pred_y - source.y, pred_x - source.x)
+        launch_x, launch_y = launch_point(source, angle)
+        speed = estimate_fleet_speed(num_ships)
+        time_to_hit = math.hypot(pred_x - launch_x, pred_y - launch_y) / max(speed, 1e-9)
+    else:
+        angle = launch_solution["angle"]
+        launch_x = launch_solution["launch_x"]
+        launch_y = launch_solution["launch_y"]
+        time_to_hit = launch_solution["time"]
     return {
         "valid": False,
         "time": float(time_to_hit),
@@ -650,6 +743,19 @@ def speed_threshold_options(min_ships, max_ships, source_production=0):
     return sorted(options)
 
 
+def limited_speed_threshold_options(min_ships, max_ships, source_production=0):
+    options = speed_threshold_options(min_ships, max_ships, source_production)
+    if len(options) <= MAX_SPEED_OPTION_CANDIDATES:
+        return options
+    selected = []
+    for idx in (0, 1, 2, len(options) // 2, len(options) - 1):
+        if 0 <= idx < len(options):
+            value = options[idx]
+            if value not in selected:
+                selected.append(value)
+    return selected
+
+
 def evaluate_regular_attack_option(
     source,
     target,
@@ -677,25 +783,6 @@ def evaluate_regular_attack_option(
         ships=int(source.ships) + int(source.production) * int(wait_turns),
     )
     future_step = int(step) + int(wait_turns)
-    initial_solution = estimate_precise_intercept(
-        future_source,
-        target,
-        ships_to_send,
-        future_step,
-        initial_planets,
-        angular_velocity_map,
-    )
-    if not initial_solution or not initial_solution.get("valid", False):
-        return None
-
-    total_eta = int(wait_turns) + int(initial_solution["eta"])
-    ships_needed = compute_attack_need(
-        target, total_eta, friendly_arrivals_by_target, planned_arrivals_by_target
-    )
-    if ships_needed <= 0 or ships_needed > ships_to_send:
-        return None
-
-    validation_mode = choose_validation_mode(target, ships_to_send, total_eta, "roi")
     solution = estimate_precise_intercept(
         future_source,
         target,
@@ -703,7 +790,6 @@ def evaluate_regular_attack_option(
         future_step,
         initial_planets,
         angular_velocity_map,
-        validation_mode=validation_mode,
     )
     if not solution or not solution.get("valid", False):
         return None
@@ -714,6 +800,8 @@ def evaluate_regular_attack_option(
     )
     if ships_needed <= 0 or ships_needed > ships_to_send:
         return None
+
+    validation_mode = choose_validation_mode(target, ships_to_send, total_eta, "roi")
     path_end_x, path_end_y = solution_path_endpoint(solution, ships_to_send)
     if segment_hits_sun(solution["launch_x"], solution["launch_y"], path_end_x, path_end_y):
         return None
@@ -759,6 +847,15 @@ def select_preferred_attack_plan(
         return None
 
     base_min_ships = max(1, int(target.ships) + 1)
+    rough_solution = solve_launch_solution(
+        source, target.x, target.y, base_min_ships, step, initial_planets, angular_velocity_map, iterations=1
+    )
+    if rough_solution is None:
+        rough_eta = estimate_eta_turns(source.x, source.y, target.x, target.y, base_min_ships)
+    else:
+        rough_eta = max(1, int(math.ceil(rough_solution["time"])))
+    if rough_eta > MAX_ROUGH_ATTACK_ETA:
+        return None
     immediate_best = None
     overall_best = None
     max_wait_turns = MAX_WAIT_TURNS if int(source.production) > 0 else 0
@@ -767,7 +864,9 @@ def select_preferred_attack_plan(
         available_after_wait = available_to_send + int(source.production) * wait_turns
         if available_after_wait < base_min_ships:
             continue
-        for ships_to_send in speed_threshold_options(base_min_ships, available_after_wait, source.production):
+        for ships_to_send in limited_speed_threshold_options(
+            base_min_ships, available_after_wait, source.production
+        ):
             plan = evaluate_regular_attack_option(
                 source,
                 target,
@@ -1054,25 +1153,6 @@ def build_supply_candidate(
     incoming_support = estimate_friendly_inbound_ships(
         frontline_target.id, eta_turns, friendly_arrivals_by_target, planned_arrivals_by_target
     )
-    predicted_frontline_ships = (
-        int(frontline_target.ships) + int(frontline_target.production) * eta_turns + incoming_support
-    )
-    deficit = max(0, desired_frontline_ships - predicted_frontline_ships)
-    ships_to_send = min(available_to_send, int(deficit))
-    if ships_to_send <= 0:
-        return None
-
-    solution = estimate_precise_intercept(
-        source,
-        frontline_target,
-        ships_to_send,
-        step,
-        initial_planets,
-        angular_velocity_map,
-    )
-    if not solution.get("valid", False):
-        return None
-    eta_turns = solution["eta"]
     path_end_x, path_end_y = solution_path_endpoint(solution, ships_to_send)
     if segment_hits_sun(solution["launch_x"], solution["launch_y"], path_end_x, path_end_y):
         return None
@@ -1201,7 +1281,10 @@ def nearest_planet_sniper(obs):
             continue
 
         candidates = []
-        for target in targets:
+        candidate_targets = sorted(
+            targets, key=lambda target: math.hypot(source.x - target.x, source.y - target.y)
+        )[:MAX_REGULAR_TARGETS]
+        for target in candidate_targets:
             candidate = build_regular_attack_candidate(
                 source,
                 target,
