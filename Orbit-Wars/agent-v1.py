@@ -134,12 +134,7 @@ def solve_launch_solution(
 ):
     speed = estimate_fleet_speed(num_ships)
     angle = math.atan2(target_y - source.y, target_x - source.x)
-
-    for _ in range(max(1, int(iterations))):
-        launch_x, launch_y = launch_point(source, angle)
-        angle = math.atan2(float(target_y) - float(launch_y), float(target_x) - float(launch_x))
-
-    launch_x, launch_y = launch_point(source, angle)
+    launch_x, launch_y = float(source.x), float(source.y)
     travel_time = math.hypot(float(target_x) - float(launch_x), float(target_y) - float(launch_y)) / max(
         speed, 1e-9
     )
@@ -284,7 +279,7 @@ def estimate_precise_intercept(
     )
     if launch_solution is None:
         angle = math.atan2(pred_y - source.y, pred_x - source.x)
-        launch_x, launch_y = launch_point(source, angle)
+        launch_x, launch_y = float(source.x), float(source.y)
         speed = estimate_fleet_speed(num_ships)
         time_to_hit = math.hypot(pred_x - launch_x, pred_y - launch_y) / max(speed, 1e-9)
     else:
@@ -318,7 +313,7 @@ def validate_intercept_solution(
     max_turns,
     validation_mode="strict",
 ):
-    launch_x, launch_y = launch_point(source, angle)
+    launch_x, launch_y = float(source.x), float(source.y)
     prev_x, prev_y = launch_x, launch_y
 
     for turn in range(1, max(1, int(max_turns)) + 1):
@@ -362,12 +357,15 @@ def estimate_target_garrison(target, eta_turns):
 def infer_fleet_target_and_eta(fleet, planets, step, initial_planets, angular_velocity_map):
     best_planet = None
     best_eta = None
+    source_planet_id = int(getattr(fleet, "from_planet_id", -1))
     dir_x = math.cos(fleet.angle)
     dir_y = math.sin(fleet.angle)
     speed = estimate_fleet_speed(fleet.ships)
     max_turns = max(1, int(math.ceil(math.hypot(BOARD_MAX, BOARD_MAX) / max(speed, 1e-9))) + 2)
 
     for planet in planets:
+        if int(planet.id) == source_planet_id:
+            continue
         prev_x, prev_y = float(fleet.x), float(fleet.y)
         for turn in range(1, max_turns + 1):
             pred_x, pred_y = predict_planet_position(
