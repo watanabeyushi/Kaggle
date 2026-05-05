@@ -25,6 +25,9 @@ INTERCEPT_SEARCH_EXPANSION = 6
 MAX_SPEED_OPTION_CANDIDATES = 5
 MAX_REGULAR_TARGETS = 6
 MAX_ROUGH_ATTACK_ETA = 28
+EARLY_PEACE_SEND_MARGIN = 3
+EARLY_PEACE_TARGETS = 10
+EARLY_PEACE_SUPPLY_STEP = 20
 
 
 def _obs_get(obs, key, default=None):
@@ -422,8 +425,21 @@ def estimate_friendly_inbound_ships(
     return inbound_ships
 
 
-def get_available_to_send(planet):
-    return max(0, int(planet.ships) - DEFENSE_MARGIN)
+def is_early_peace(board_state):
+    return bool(board_state and board_state.get("early_peace", False))
+
+
+def effective_defense_margin(planet, board_state=None):
+    if not is_early_peace(board_state):
+        return DEFENSE_MARGIN
+    production_margin = max(EARLY_PEACE_SEND_MARGIN, min(5, int(getattr(planet, "production", 0)) + 1))
+    if board_state is not None and len(board_state.get("my_planets", [])) <= 2:
+        production_margin += 1
+    return min(DEFENSE_MARGIN, production_margin)
+
+
+def get_available_to_send(planet, board_state=None):
+    return max(0, int(planet.ships) - effective_defense_margin(planet, board_state))
 
 
 def compute_attack_need(
@@ -627,10 +643,15 @@ def target_value(target, eta_turns, board_state, mission_type="attack"):
     )
     gateway_multiplier = 1.0 + 0.25 * gateway_bonus(target, eta_turns, board_state)
     gateway_multiplier += 0.12 * gateway_branch_score(target, eta_turns, board_state)
+    if is_early_peace(board_state):
+        production_value *= 1.15 + future_window / 80.0
+        gateway_multiplier += 0.08 * gateway_bonus(target, eta_turns, board_state)
 
     if mission_type == "supply":
         frontline_pressure = 1.0 / max(8.0, enemy_distance)
         owned_multiplier = 1.0 + frontline_pressure * 6.0
+        if is_early_peace(board_state):
+            owned_multiplier *= 0.7
         return production_value * (0.7 + tempo_value * 0.6) * cluster_multiplier * owned_multiplier
 
     my_distance = nearest_predicted_distance_to_group(
@@ -643,6 +664,8 @@ def target_value(target, eta_turns, board_state, mission_type="attack"):
     neutral_multiplier = 1.0
     if int(target.owner) == -1 and not math.isinf(neutral_distance):
         neutral_multiplier += 0.25 / (1.0 + neutral_distance / 18.0)
+        if is_early_peace(board_state):
+            neutral_multiplier += 0.18 / (1.0 + eta_turns / 10.0)
     owner_multiplier = 1.12 if int(target.owner) != -1 else 1.0
     return (
         production_value
@@ -669,7 +692,10 @@ def source_optionality_cost(source, ships_to_send, available_to_send, board_stat
     flexibility_penalty = commit_ratio * (
         0.05 + 0.08 * frontline_pressure + 0.05 * scarcity_factor + 0.04 * production_factor
     )
-    return flexibility_penalty * early_factor * (1.0 - 0.35 * reserve_ratio)
+    cost = flexibility_penalty * early_factor * (1.0 - 0.35 * reserve_ratio)
+    if is_early_peace(board_state):
+        cost *= 0.45
+    return cost
 
 
 def target_stability_cost(target, eta_turns, board_state, mission_type="attack"):
@@ -692,7 +718,10 @@ def target_stability_cost(target, eta_turns, board_state, mission_type="attack")
     if mission_type == "supply":
         competition_penalty *= 0.5
         frontline_penalty *= 0.6
-    return (competition_penalty + frontline_penalty + eta_penalty + owner_penalty) * early_factor
+    cost = (competition_penalty + frontline_penalty + eta_penalty + owner_penalty) * early_factor
+    if is_early_peace(board_state):
+        cost *= 0.4 if mission_type == "attack" else 0.2
+    return cost
 
 
 def mission_score(
@@ -716,6 +745,8 @@ def mission_score(
     if mission_type == "supply":
         source_cost *= 0.75
         stability_cost *= 0.6
+    elif mission_type == "attack" and is_early_peace(board_state):
+        base_score *= 1.0 + min(0.4, float(target.production) / 10.0) + 0.18 / (1.0 + float(eta_turns) / 6.0)
     return base_score - source_cost - stability_cost
 
 
@@ -768,7 +799,7 @@ def evaluate_regular_attack_option(
     planned_arrivals_by_target,
     board_state,
 ):
-    available_after_wait = get_available_to_send(source) + int(source.production) * int(wait_turns)
+    available_after_wait = get_available_to_send(source, board_state) + int(source.production) * int(wait_turns)
     ships_to_send = int(ships_to_send)
     if ships_to_send <= 0 or ships_to_send > available_after_wait:
         return None
@@ -817,6 +848,10 @@ def evaluate_regular_attack_option(
         board_state,
         mission_type="attack",
     )
+    if is_early_peace(board_state):
+        if int(target.owner) == -1:
+            score += max(0.0, float(target.production) * 0.16 - float(wait_turns) * 0.22)
+        score += max(0.0, 0.24 - max(0, ships_to_send - ships_needed) * 0.015)
     return {
         "type": "roi",
         "source_id": int(source.id),
@@ -842,7 +877,7 @@ def select_preferred_attack_plan(
     planned_arrivals_by_target,
     board_state,
 ):
-    available_to_send = get_available_to_send(source)
+    available_to_send = get_available_to_send(source, board_state)
     if available_to_send <= 0:
         return None
 
@@ -904,6 +939,8 @@ def select_preferred_attack_plan(
         return None
     if immediate_best is None:
         return overall_best
+    if is_early_peace(board_state):
+        return immediate_best
     if overall_best["wait_turns"] > 0 and (
         overall_best["effective_time"] + WAIT_ADVANTAGE_MARGIN < immediate_best["effective_time"]
     ):
@@ -1025,7 +1062,7 @@ def build_intercept_candidate(
     planned_arrivals_by_target,
     board_state,
 ):
-    available_to_send = get_available_to_send(source)
+    available_to_send = get_available_to_send(source, board_state)
     if available_to_send <= 0:
         return None
 
@@ -1108,11 +1145,16 @@ def build_supply_candidate(
     planned_arrivals_by_target,
     board_state,
 ):
-    available_to_send = get_available_to_send(source)
+    available_to_send = get_available_to_send(source, board_state)
     if available_to_send <= 0 or source.id == frontline_target.id:
         return None
+    if is_early_peace(board_state):
+        if int(step) < EARLY_PEACE_SUPPLY_STEP:
+            return None
+        if board_state.get("neutral_planets"):
+            return None
 
-    probe_ships = max(1, min(available_to_send, DEFENSE_MARGIN))
+    probe_ships = max(1, min(available_to_send, effective_defense_margin(source, board_state)))
     solution = estimate_precise_intercept(
         source,
         frontline_target,
@@ -1131,6 +1173,11 @@ def build_supply_candidate(
         int(frontline_target.ships) + int(frontline_target.production) * eta_turns + incoming_support
     )
     desired_frontline_ships = max(DEFENSE_MARGIN * 3, int(frontline_target.production) * 4)
+    if is_early_peace(board_state):
+        desired_frontline_ships = max(
+            effective_defense_margin(frontline_target, board_state) * 2,
+            int(frontline_target.production) * 2,
+        )
     deficit = desired_frontline_ships - predicted_frontline_ships
     if deficit <= 0:
         return None
@@ -1169,6 +1216,8 @@ def build_supply_candidate(
         mission_type="supply",
         opportunity_multiplier=1.0 + pressure * 6.0,
     )
+    if is_early_peace(board_state):
+        score *= 0.55
     return {
         "type": "supply",
         "source_id": int(source.id),
@@ -1205,6 +1254,7 @@ def nearest_planet_sniper(obs):
     board_state = {
         "player": int(player),
         "step": int(step),
+        "early_peace": int(step) < EARLY_GAME_TURNS,
         "planets": planets,
         "my_planets": my_planets,
         "targets": targets,
@@ -1237,11 +1287,11 @@ def nearest_planet_sniper(obs):
     used_source_ids = set()
     reserved_source_ids = set()
 
-    for source in sorted(my_planets, key=lambda planet: get_available_to_send(planet), reverse=True):
+    for source in sorted(my_planets, key=lambda planet: get_available_to_send(planet, board_state), reverse=True):
         if (
             source.id in used_source_ids
             or source.id in reserved_source_ids
-            or get_available_to_send(source) <= 0
+            or get_available_to_send(source, board_state) <= 0
         ):
             continue
 
@@ -1272,18 +1322,24 @@ def nearest_planet_sniper(obs):
             )
             used_source_ids.add(best_candidate["source_id"])
 
-    for source in sorted(my_planets, key=lambda planet: get_available_to_send(planet), reverse=True):
+    for source in sorted(my_planets, key=lambda planet: get_available_to_send(planet, board_state), reverse=True):
         if (
             source.id in used_source_ids
             or source.id in reserved_source_ids
-            or get_available_to_send(source) <= 0
+            or get_available_to_send(source, board_state) <= 0
         ):
             continue
 
         candidates = []
+        target_limit = EARLY_PEACE_TARGETS if is_early_peace(board_state) else MAX_REGULAR_TARGETS
         candidate_targets = sorted(
-            targets, key=lambda target: math.hypot(source.x - target.x, source.y - target.y)
-        )[:MAX_REGULAR_TARGETS]
+            targets,
+            key=lambda target: (
+                math.hypot(source.x - target.x, source.y - target.y)
+                / max(1.0, 1.0 + float(target.production) * (0.8 if int(target.owner) == -1 else 0.4)),
+                0 if int(target.owner) == -1 else 1,
+            ),
+        )[:target_limit]
         for target in candidate_targets:
             candidate = build_regular_attack_candidate(
                 source,
@@ -1302,7 +1358,7 @@ def nearest_planet_sniper(obs):
         ranked_candidates = rank_candidates(candidates)
         if ranked_candidates:
             best_candidate = ranked_candidates[0]
-            if best_candidate.get("wait_turns", 0) > 0:
+            if best_candidate.get("wait_turns", 0) > 0 and not is_early_peace(board_state):
                 reserved_source_ids.add(best_candidate["source_id"])
                 continue
             moves.append([best_candidate["source_id"], best_candidate["angle"], best_candidate["ships"]])
@@ -1311,11 +1367,11 @@ def nearest_planet_sniper(obs):
             )
             used_source_ids.add(best_candidate["source_id"])
 
-    for source in sorted(rear_planets, key=lambda planet: get_available_to_send(planet), reverse=True):
+    for source in sorted(rear_planets, key=lambda planet: get_available_to_send(planet, board_state), reverse=True):
         if (
             source.id in used_source_ids
             or source.id in reserved_source_ids
-            or get_available_to_send(source) <= 0
+            or get_available_to_send(source, board_state) <= 0
         ):
             continue
 
