@@ -28,6 +28,7 @@ MAX_ROUGH_ATTACK_ETA = 28
 EARLY_PEACE_SEND_MARGIN = 3
 EARLY_PEACE_TARGETS = 10
 EARLY_PEACE_SUPPLY_STEP = 20
+EARLY_PAYBACK_HORIZON = 18.0
 
 
 def _obs_get(obs, key, default=None):
@@ -429,13 +430,32 @@ def is_early_peace(board_state):
     return bool(board_state and board_state.get("early_peace", False))
 
 
+def expansion_pressure(board_state):
+    if not board_state:
+        return 0.0
+    return clamp(float(board_state.get("expansion_pressure", 0.0)), 0.0, 1.0)
+
+
+def compute_expansion_pressure(step, neutral_planets, enemy_arrivals_by_target=None):
+    step_factor = clamp((EARLY_GAME_TURNS - float(step)) / EARLY_GAME_TURNS, 0.0, 1.0)
+    neutral_factor = clamp(float(neutral_planets) / 8.0, 0.0, 1.0)
+    enemy_arrival_count = 0
+    if enemy_arrivals_by_target:
+        enemy_arrival_count = sum(len(arrivals) for arrivals in enemy_arrivals_by_target.values())
+    threat_factor = clamp(float(enemy_arrival_count) / 6.0, 0.0, 1.0)
+    return clamp(step_factor * (0.45 + 0.55 * neutral_factor) * (1.0 - 0.7 * threat_factor), 0.0, 1.0)
+
+
 def effective_defense_margin(planet, board_state=None):
-    if not is_early_peace(board_state):
+    pressure = expansion_pressure(board_state)
+    if pressure <= 1e-6:
         return DEFENSE_MARGIN
     production_margin = max(EARLY_PEACE_SEND_MARGIN, min(5, int(getattr(planet, "production", 0)) + 1))
     if board_state is not None and len(board_state.get("my_planets", [])) <= 2:
         production_margin += 1
-    return min(DEFENSE_MARGIN, production_margin)
+    relaxed_margin = min(DEFENSE_MARGIN, production_margin)
+    blended_margin = DEFENSE_MARGIN + (relaxed_margin - DEFENSE_MARGIN) * pressure
+    return max(1, int(round(blended_margin)))
 
 
 def get_available_to_send(planet, board_state=None):
@@ -608,7 +628,10 @@ def gateway_bonus(target, eta_turns, board_state):
     if not sample_scores:
         return 0.0
     best_scores = sorted(sample_scores, reverse=True)[:3]
-    return sum(best_scores) / max(1.0, 8.0 * len(best_scores))
+    pressure = expansion_pressure(board_state)
+    eta_factor = 1.0 / (1.0 + max(1.0, float(eta_turns)) / 14.0)
+    weight = 1.0 + pressure * 0.9 * eta_factor
+    return (sum(best_scores) / max(1.0, 8.0 * len(best_scores))) * weight
 
 
 def gateway_branch_score(target, eta_turns, board_state):
@@ -627,11 +650,26 @@ def gateway_branch_score(target, eta_turns, board_state):
         branch_scores.append(first_score * 0.35 + second_score * 0.18)
     if not branch_scores:
         return 0.0
-    return max(branch_scores) / 8.0
+    pressure = expansion_pressure(board_state)
+    eta_factor = 1.0 / (1.0 + max(1.0, float(eta_turns)) / 16.0)
+    return (max(branch_scores) / 8.0) * (1.0 + pressure * 0.8 * eta_factor)
+
+
+def payback_bonus(target, ships_to_send, eta_turns, board_state):
+    pressure = expansion_pressure(board_state)
+    if pressure <= 1e-6:
+        return 0.0
+    production = max(1.0, float(target.production))
+    payback_turns = float(ships_to_send) / production
+    total_delay = float(eta_turns) + payback_turns
+    recovery_factor = 1.0 / (1.0 + total_delay / EARLY_PAYBACK_HORIZON)
+    neutral_factor = 1.15 if int(target.owner) == -1 else 0.85
+    return pressure * neutral_factor * recovery_factor * (0.45 + 0.08 * production)
 
 
 def target_value(target, eta_turns, board_state, mission_type="attack"):
     eta_turns = max(1, int(math.ceil(eta_turns)))
+    pressure = expansion_pressure(board_state)
     base_production = max(1.0, float(target.production))
     future_window = max(0.0, EARLY_GAME_TURNS - float(board_state["step"] + eta_turns))
     production_value = base_production * (1.0 + future_window / 18.0)
@@ -641,17 +679,17 @@ def target_value(target, eta_turns, board_state, mission_type="attack"):
     enemy_distance = nearest_predicted_distance_to_group(
         target, board_state["enemy_planets"], eta_turns, board_state
     )
-    gateway_multiplier = 1.0 + 0.25 * gateway_bonus(target, eta_turns, board_state)
-    gateway_multiplier += 0.12 * gateway_branch_score(target, eta_turns, board_state)
-    if is_early_peace(board_state):
-        production_value *= 1.15 + future_window / 80.0
-        gateway_multiplier += 0.08 * gateway_bonus(target, eta_turns, board_state)
+    gateway_weight = 0.25 + pressure * 0.18
+    branch_weight = 0.12 + pressure * 0.1
+    gateway_multiplier = 1.0 + gateway_weight * gateway_bonus(target, eta_turns, board_state)
+    gateway_multiplier += branch_weight * gateway_branch_score(target, eta_turns, board_state)
+    if pressure > 1e-6:
+        production_value *= 1.0 + pressure * (0.15 + future_window / 80.0)
 
     if mission_type == "supply":
         frontline_pressure = 1.0 / max(8.0, enemy_distance)
         owned_multiplier = 1.0 + frontline_pressure * 6.0
-        if is_early_peace(board_state):
-            owned_multiplier *= 0.7
+        owned_multiplier *= 1.0 - pressure * 0.3
         return production_value * (0.7 + tempo_value * 0.6) * cluster_multiplier * owned_multiplier
 
     my_distance = nearest_predicted_distance_to_group(
@@ -664,8 +702,7 @@ def target_value(target, eta_turns, board_state, mission_type="attack"):
     neutral_multiplier = 1.0
     if int(target.owner) == -1 and not math.isinf(neutral_distance):
         neutral_multiplier += 0.25 / (1.0 + neutral_distance / 18.0)
-        if is_early_peace(board_state):
-            neutral_multiplier += 0.18 / (1.0 + eta_turns / 10.0)
+        neutral_multiplier += pressure * (0.18 / (1.0 + eta_turns / 10.0))
     owner_multiplier = 1.12 if int(target.owner) != -1 else 1.0
     return (
         production_value
@@ -693,8 +730,7 @@ def source_optionality_cost(source, ships_to_send, available_to_send, board_stat
         0.05 + 0.08 * frontline_pressure + 0.05 * scarcity_factor + 0.04 * production_factor
     )
     cost = flexibility_penalty * early_factor * (1.0 - 0.35 * reserve_ratio)
-    if is_early_peace(board_state):
-        cost *= 0.45
+    cost *= 1.0 - 0.55 * expansion_pressure(board_state)
     return cost
 
 
@@ -719,8 +755,9 @@ def target_stability_cost(target, eta_turns, board_state, mission_type="attack")
         competition_penalty *= 0.5
         frontline_penalty *= 0.6
     cost = (competition_penalty + frontline_penalty + eta_penalty + owner_penalty) * early_factor
-    if is_early_peace(board_state):
-        cost *= 0.4 if mission_type == "attack" else 0.2
+    pressure = expansion_pressure(board_state)
+    if pressure > 1e-6:
+        cost *= 1.0 - pressure * (0.6 if mission_type == "attack" else 0.8)
     return cost
 
 
@@ -745,8 +782,13 @@ def mission_score(
     if mission_type == "supply":
         source_cost *= 0.75
         stability_cost *= 0.6
-    elif mission_type == "attack" and is_early_peace(board_state):
-        base_score *= 1.0 + min(0.4, float(target.production) / 10.0) + 0.18 / (1.0 + float(eta_turns) / 6.0)
+    elif mission_type == "attack":
+        pressure = expansion_pressure(board_state)
+        if pressure > 1e-6:
+            base_score *= 1.0 + pressure * (
+                min(0.4, float(target.production) / 10.0) + 0.18 / (1.0 + float(eta_turns) / 6.0)
+            )
+            base_score += payback_bonus(target, ships_to_send, eta_turns, board_state)
     return base_score - source_cost - stability_cost
 
 
@@ -848,10 +890,16 @@ def evaluate_regular_attack_option(
         board_state,
         mission_type="attack",
     )
-    if is_early_peace(board_state):
+    if expansion_pressure(board_state) > 1e-6:
         if int(target.owner) == -1:
-            score += max(0.0, float(target.production) * 0.16 - float(wait_turns) * 0.22)
-        score += max(0.0, 0.24 - max(0, ships_to_send - ships_needed) * 0.015)
+            score += max(
+                0.0,
+                expansion_pressure(board_state) * (float(target.production) * 0.16 - float(wait_turns) * 0.22),
+            )
+        score += max(
+            0.0,
+            expansion_pressure(board_state) * (0.24 - max(0, ships_to_send - ships_needed) * 0.015),
+        )
     return {
         "type": "roi",
         "source_id": int(source.id),
@@ -939,7 +987,7 @@ def select_preferred_attack_plan(
         return None
     if immediate_best is None:
         return overall_best
-    if is_early_peace(board_state):
+    if expansion_pressure(board_state) >= 0.55:
         return immediate_best
     if overall_best["wait_turns"] > 0 and (
         overall_best["effective_time"] + WAIT_ADVANTAGE_MARGIN < immediate_best["effective_time"]
@@ -1148,7 +1196,8 @@ def build_supply_candidate(
     available_to_send = get_available_to_send(source, board_state)
     if available_to_send <= 0 or source.id == frontline_target.id:
         return None
-    if is_early_peace(board_state):
+    expansion_bias = expansion_pressure(board_state)
+    if expansion_bias > 0.45:
         if int(step) < EARLY_PEACE_SUPPLY_STEP:
             return None
         if board_state.get("neutral_planets"):
@@ -1173,7 +1222,7 @@ def build_supply_candidate(
         int(frontline_target.ships) + int(frontline_target.production) * eta_turns + incoming_support
     )
     desired_frontline_ships = max(DEFENSE_MARGIN * 3, int(frontline_target.production) * 4)
-    if is_early_peace(board_state):
+    if expansion_bias > 1e-6:
         desired_frontline_ships = max(
             effective_defense_margin(frontline_target, board_state) * 2,
             int(frontline_target.production) * 2,
@@ -1204,7 +1253,7 @@ def build_supply_candidate(
     if segment_hits_sun(solution["launch_x"], solution["launch_y"], path_end_x, path_end_y):
         return None
 
-    pressure = 1.0 / max(1.0, min_distance_to_targets(frontline_target, targets))
+    frontline_pressure = 1.0 / max(1.0, min_distance_to_targets(frontline_target, targets))
     score = mission_score(
         source,
         frontline_target,
@@ -1214,10 +1263,10 @@ def build_supply_candidate(
         available_to_send,
         board_state,
         mission_type="supply",
-        opportunity_multiplier=1.0 + pressure * 6.0,
+        opportunity_multiplier=1.0 + frontline_pressure * 6.0,
     )
-    if is_early_peace(board_state):
-        score *= 0.55
+    if expansion_bias > 1e-6:
+        score *= 1.0 - 0.45 * expansion_bias
     return {
         "type": "supply",
         "source_id": int(source.id),
@@ -1255,6 +1304,7 @@ def nearest_planet_sniper(obs):
         "player": int(player),
         "step": int(step),
         "early_peace": int(step) < EARLY_GAME_TURNS,
+        "expansion_pressure": 0.0,
         "planets": planets,
         "my_planets": my_planets,
         "targets": targets,
@@ -1275,6 +1325,9 @@ def nearest_planet_sniper(obs):
                 friendly_arrivals_by_target[target_id].append((eta_turns, owner, ships))
             else:
                 enemy_arrivals_by_target[target_id].append((eta_turns, owner, ships))
+    board_state["expansion_pressure"] = compute_expansion_pressure(
+        step, len(board_state["neutral_planets"]), enemy_arrivals_by_target
+    )
 
     intercept_windows_by_target = {
         target.id: build_intercept_windows(
@@ -1331,7 +1384,10 @@ def nearest_planet_sniper(obs):
             continue
 
         candidates = []
-        target_limit = EARLY_PEACE_TARGETS if is_early_peace(board_state) else MAX_REGULAR_TARGETS
+        target_limit = max(
+            MAX_REGULAR_TARGETS,
+            int(round(MAX_REGULAR_TARGETS + (EARLY_PEACE_TARGETS - MAX_REGULAR_TARGETS) * expansion_pressure(board_state))),
+        )
         candidate_targets = sorted(
             targets,
             key=lambda target: (
@@ -1358,7 +1414,7 @@ def nearest_planet_sniper(obs):
         ranked_candidates = rank_candidates(candidates)
         if ranked_candidates:
             best_candidate = ranked_candidates[0]
-            if best_candidate.get("wait_turns", 0) > 0 and not is_early_peace(board_state):
+            if best_candidate.get("wait_turns", 0) > 0 and expansion_pressure(board_state) < 0.55:
                 reserved_source_ids.add(best_candidate["source_id"])
                 continue
             moves.append([best_candidate["source_id"], best_candidate["angle"], best_candidate["ships"]])
