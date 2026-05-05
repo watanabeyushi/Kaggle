@@ -319,9 +319,6 @@ def validate_intercept_solution(
     validation_mode="strict",
 ):
     launch_x, launch_y = launch_point(source, angle)
-    speed = estimate_fleet_speed(num_ships)
-    dir_x = math.cos(angle)
-    dir_y = math.sin(angle)
     prev_x, prev_y = launch_x, launch_y
 
     for turn in range(1, max(1, int(max_turns)) + 1):
@@ -330,28 +327,26 @@ def validate_intercept_solution(
             target, turn - 1, step, initial_planets, angular_velocity_map
         )
 
-        hit_distance = ray_circle_hit_distance(
-            prev_x, prev_y, dir_x, dir_y, target_before_x, target_before_y, target.radius
-        )
-        if hit_distance is not None and hit_distance <= speed + 1e-6:
-            hit_x = prev_x + dir_x * hit_distance
-            hit_y = prev_y + dir_y * hit_distance
+        if segment_hits_sun(prev_x, prev_y, curr_x, curr_y):
+            return None
+
+        if not is_in_bounds(curr_x, curr_y):
+            break
+
+        if math.hypot(curr_x - target_before_x, curr_y - target_before_y) <= float(target.radius) + 1e-6:
             return {
                 "valid": True,
-                "time": float(turn - 1 + (hit_distance / max(speed, 1e-9))),
+                "time": float(turn),
                 "eta": int(turn),
                 "pred_x": float(target_before_x),
                 "pred_y": float(target_before_y),
-                "aim_x": float(hit_x),
-                "aim_y": float(hit_y),
+                "aim_x": float(curr_x),
+                "aim_y": float(curr_y),
                 "launch_x": float(launch_x),
                 "launch_y": float(launch_y),
                 "angle": float(angle),
                 "uses_sweep": False,
             }
-
-        if not is_in_bounds(curr_x, curr_y):
-            break
 
         prev_x, prev_y = curr_x, curr_y
 
@@ -378,17 +373,16 @@ def infer_fleet_target_and_eta(fleet, planets, step, initial_planets, angular_ve
             pred_x, pred_y = predict_planet_position(
                 planet, turn - 1, step, initial_planets, angular_velocity_map
             )
-            hit_distance = ray_circle_hit_distance(
-                prev_x, prev_y, dir_x, dir_y, pred_x, pred_y, planet.radius
-            )
-            if hit_distance is not None and hit_distance <= speed + 1e-6:
+            curr_x = float(fleet.x) + dir_x * speed * turn
+            curr_y = float(fleet.y) + dir_y * speed * turn
+            if segment_hits_sun(prev_x, prev_y, curr_x, curr_y):
+                break
+            if not is_in_bounds(curr_x, curr_y):
+                break
+            if math.hypot(curr_x - pred_x, curr_y - pred_y) <= float(planet.radius) + 1e-6:
                 if best_eta is None or turn < best_eta:
                     best_eta = turn
                     best_planet = planet
-                break
-            curr_x = float(fleet.x) + dir_x * speed * turn
-            curr_y = float(fleet.y) + dir_y * speed * turn
-            if not is_in_bounds(curr_x, curr_y):
                 break
             prev_x, prev_y = curr_x, curr_y
 
