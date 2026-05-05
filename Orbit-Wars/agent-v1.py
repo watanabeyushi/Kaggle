@@ -840,21 +840,25 @@ def evaluate_regular_attack_option(
     if ships_to_send <= 0 or ships_to_send > available_after_wait:
         return None
 
-    future_source_x, future_source_y = predict_planet_position(
-        source, wait_turns, step, initial_planets, angular_velocity_map
-    )
-    future_source = make_planet_proxy(
-        source,
-        future_source_x,
-        future_source_y,
-        ships=int(source.ships) + int(source.production) * int(wait_turns),
-    )
-    future_step = int(step) + int(wait_turns)
+    launch_source = source
+    launch_step = int(step)
+    if int(wait_turns) > 0:
+        future_source_x, future_source_y = predict_planet_position(
+            source, wait_turns, step, initial_planets, angular_velocity_map
+        )
+        launch_source = make_planet_proxy(
+            source,
+            future_source_x,
+            future_source_y,
+            ships=int(source.ships) + int(source.production) * int(wait_turns),
+        )
+        launch_step = int(step) + int(wait_turns)
+
     solution = estimate_precise_intercept(
-        future_source,
+        launch_source,
         target,
         ships_to_send,
-        future_step,
+        launch_step,
         initial_planets,
         angular_velocity_map,
     )
