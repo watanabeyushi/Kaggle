@@ -29,6 +29,7 @@ EARLY_PEACE_SEND_MARGIN = 3
 EARLY_PEACE_TARGETS = 10
 EARLY_PEACE_SUPPLY_STEP = 20
 EARLY_PAYBACK_HORIZON = 18.0
+TIME_OFFSET_EXPERIMENTS = (-1, 0, 1)
 
 
 def _obs_get(obs, key, default=None):
@@ -53,7 +54,7 @@ def _is_orbiting_initial(planet_row):
     return orbital_radius + radius < 50.0
 
 
-def predict_planet_position(planet, future_turns, step, initial_planets, angular_velocity_map):
+def predict_planet_position(planet, future_turns, step, initial_planets, angular_velocity_map, time_offset=0):
     future_turns = max(0.0, float(future_turns))
     base = None
     if isinstance(initial_planets, (list, tuple)) and 0 <= planet.id < len(initial_planets):
@@ -71,8 +72,14 @@ def predict_planet_position(planet, future_turns, step, initial_planets, angular
 
     orbital_radius = math.hypot(x0 - SUN_X, y0 - SUN_Y)
     theta0 = math.atan2(y0 - SUN_Y, x0 - SUN_X)
-    theta = theta0 + omega * (step + future_turns)
+    theta = theta0 + omega * (float(step) + future_turns + float(time_offset))
     return SUN_X + orbital_radius * math.cos(theta), SUN_Y + orbital_radius * math.sin(theta)
+
+
+def board_time_offset(board_state=None):
+    if not board_state:
+        return -1
+    return int(board_state.get("time_offset", 0) or 0)
 
 
 def launch_point(planet, angle, clearance=LAUNCH_CLEARANCE):
@@ -175,7 +182,7 @@ def max_intercept_turns(num_ships):
     return max(1, int(math.ceil(board_diagonal / max(speed, 1e-9))) + 2)
 
 
-def candidate_intercept_turns(source, target, num_ships, step, initial_planets, angular_velocity_map):
+def candidate_intercept_turns(source, target, num_ships, step, initial_planets, angular_velocity_map, time_offset=0):
     max_turns = max_intercept_turns(num_ships)
     base_solution = solve_launch_solution(
         source, target.x, target.y, num_ships, step, initial_planets, angular_velocity_map, iterations=1
@@ -185,7 +192,7 @@ def candidate_intercept_turns(source, target, num_ships, step, initial_planets, 
     else:
         base_eta = max(1, int(math.ceil(base_solution["time"])))
     pred_x, pred_y = predict_planet_position(
-        target, max(0, base_eta - 1), step, initial_planets, angular_velocity_map
+        target, max(0, base_eta - 1), step, initial_planets, angular_velocity_map, time_offset=time_offset
     )
     solved = solve_launch_solution(
         source, pred_x, pred_y, num_ships, step, initial_planets, angular_velocity_map, iterations=1
@@ -223,16 +230,23 @@ def solution_path_endpoint(solution, num_ships):
 
 
 def estimate_precise_intercept(
-    source, target, num_ships, step, initial_planets, angular_velocity_map, validation_mode="strict"
+    source,
+    target,
+    num_ships,
+    step,
+    initial_planets,
+    angular_velocity_map,
+    validation_mode="strict",
+    time_offset=0,
 ):
     best_solution = None
     best_key = None
 
     for turn in candidate_intercept_turns(
-        source, target, num_ships, step, initial_planets, angular_velocity_map
+        source, target, num_ships, step, initial_planets, angular_velocity_map, time_offset=time_offset
     ):
         pred_x, pred_y = predict_planet_position(
-            target, turn - 1, step, initial_planets, angular_velocity_map
+            target, turn - 1, step, initial_planets, angular_velocity_map, time_offset=time_offset
         )
         launch_solution = solve_launch_solution(
             source, pred_x, pred_y, num_ships, step, initial_planets, angular_velocity_map
@@ -249,9 +263,12 @@ def estimate_precise_intercept(
             angular_velocity_map,
             max_turns=turn,
             validation_mode=validation_mode,
+            time_offset=time_offset,
         )
         if solution is None:
             continue
+        solution["turn_hint"] = int(turn)
+        solution["turn_gap"] = abs(int(solution["eta"]) - int(turn))
         candidate_key = (
             int(solution["eta"]),
             float(solution["time"]),
@@ -272,7 +289,7 @@ def estimate_precise_intercept(
     else:
         fallback_turn = max(1, int(math.ceil(fallback_solution["time"])))
     pred_x, pred_y = predict_planet_position(
-        target, fallback_turn - 1, step, initial_planets, angular_velocity_map
+        target, fallback_turn - 1, step, initial_planets, angular_velocity_map, time_offset=time_offset
     )
     launch_solution = solve_launch_solution(
         source, pred_x, pred_y, num_ships, step, initial_planets, angular_velocity_map
@@ -299,6 +316,8 @@ def estimate_precise_intercept(
         "launch_y": float(launch_y),
         "angle": float(angle),
         "uses_sweep": False,
+        "turn_hint": int(fallback_turn),
+        "turn_gap": 0,
     }
 
 
@@ -312,6 +331,7 @@ def validate_intercept_solution(
     angular_velocity_map,
     max_turns,
     validation_mode="strict",
+    time_offset=0,
 ):
     launch_x, launch_y = float(source.x), float(source.y)
     prev_x, prev_y = launch_x, launch_y
@@ -319,7 +339,7 @@ def validate_intercept_solution(
     for turn in range(1, max(1, int(max_turns)) + 1):
         curr_x, curr_y = fleet_position_after_time(launch_x, launch_y, angle, num_ships, turn)
         target_before_x, target_before_y = predict_planet_position(
-            target, turn - 1, step, initial_planets, angular_velocity_map
+            target, turn - 1, step, initial_planets, angular_velocity_map, time_offset=time_offset
         )
 
         if segment_hits_sun(prev_x, prev_y, curr_x, curr_y):
@@ -355,6 +375,14 @@ def estimate_target_garrison(target, eta_turns):
 
 
 def infer_fleet_target_and_eta(fleet, planets, step, initial_planets, angular_velocity_map):
+    return infer_fleet_target_and_eta_with_offset(
+        fleet, planets, step, initial_planets, angular_velocity_map, time_offset=0
+    )
+
+
+def infer_fleet_target_and_eta_with_offset(
+    fleet, planets, step, initial_planets, angular_velocity_map, time_offset=0
+):
     best_planet = None
     best_eta = None
     source_planet_id = int(getattr(fleet, "from_planet_id", -1))
@@ -369,7 +397,7 @@ def infer_fleet_target_and_eta(fleet, planets, step, initial_planets, angular_ve
         prev_x, prev_y = float(fleet.x), float(fleet.y)
         for turn in range(1, max_turns + 1):
             pred_x, pred_y = predict_planet_position(
-                planet, turn - 1, step, initial_planets, angular_velocity_map
+                planet, turn - 1, step, initial_planets, angular_velocity_map, time_offset=time_offset
             )
             curr_x = float(fleet.x) + dir_x * speed * turn
             curr_y = float(fleet.y) + dir_y * speed * turn
@@ -387,11 +415,11 @@ def infer_fleet_target_and_eta(fleet, planets, step, initial_planets, angular_ve
     return best_planet, best_eta
 
 
-def build_arrivals_by_target(fleets, planets, step, initial_planets, angular_velocity_map):
+def build_arrivals_by_target(fleets, planets, step, initial_planets, angular_velocity_map, time_offset=0):
     arrivals_by_target = defaultdict(list)
     for fleet in fleets:
-        target_planet, fleet_eta = infer_fleet_target_and_eta(
-            fleet, planets, step, initial_planets, angular_velocity_map
+        target_planet, fleet_eta = infer_fleet_target_and_eta_with_offset(
+            fleet, planets, step, initial_planets, angular_velocity_map, time_offset=time_offset
         )
         if target_planet is None or fleet_eta is None:
             continue
@@ -399,6 +427,51 @@ def build_arrivals_by_target(fleets, planets, step, initial_planets, angular_vel
             (int(fleet_eta), int(fleet.owner), int(fleet.ships))
         )
     return arrivals_by_target
+
+
+def compare_single_target_time_offsets(
+    source,
+    target,
+    num_ships,
+    step,
+    initial_planets,
+    angular_velocity_map,
+    offsets=TIME_OFFSET_EXPERIMENTS,
+    validation_mode="strict",
+):
+    results = []
+    for time_offset in offsets:
+        solution = estimate_precise_intercept(
+            source,
+            target,
+            num_ships,
+            step,
+            initial_planets,
+            angular_velocity_map,
+            validation_mode=validation_mode,
+            time_offset=time_offset,
+        )
+        result = {
+            "offset": int(time_offset),
+            "valid": bool(solution.get("valid", False)),
+            "eta": int(solution["eta"]),
+            "time": float(solution["time"]),
+            "turn_hint": int(solution.get("turn_hint", solution["eta"])),
+            "turn_gap": int(solution.get("turn_gap", 0)),
+            "pred_x": float(solution["pred_x"]),
+            "pred_y": float(solution["pred_y"]),
+            "aim_x": float(solution["aim_x"]),
+            "aim_y": float(solution["aim_y"]),
+            "angle": float(solution["angle"]),
+            "rank_key": (
+                0 if solution.get("valid", False) else 1,
+                int(solution.get("turn_gap", 0)),
+                int(solution["eta"]),
+                float(solution["time"]),
+            ),
+        }
+        results.append(result)
+    return sorted(results, key=lambda result: result["rank_key"])
 
 
 def estimate_friendly_inbound_ships(
@@ -516,6 +589,7 @@ def predicted_distance_between_planets(planet_a, planet_b, future_turns, board_s
         board_state["step"],
         board_state["initial_planets"],
         board_state["angular_velocity_map"],
+        time_offset=board_time_offset(board_state),
     )
     bx, by = predict_planet_position(
         planet_b,
@@ -523,6 +597,7 @@ def predicted_distance_between_planets(planet_a, planet_b, future_turns, board_s
         board_state["step"],
         board_state["initial_planets"],
         board_state["angular_velocity_map"],
+        time_offset=board_time_offset(board_state),
     )
     return math.hypot(ax - bx, ay - by)
 
@@ -583,6 +658,7 @@ def best_gateway_followup(target, future_turns, board_state, exclude_ids=None):
         board_state["step"],
         board_state["initial_planets"],
         board_state["angular_velocity_map"],
+        time_offset=board_time_offset(board_state),
     )
     best_planet = None
     best_score = 0.0
@@ -597,6 +673,7 @@ def best_gateway_followup(target, future_turns, board_state, exclude_ids=None):
             board_state["step"],
             board_state["initial_planets"],
             board_state["angular_velocity_map"],
+            time_offset=board_time_offset(board_state),
         )
         distance = math.hypot(tx - px, ty - py)
         production = max(1.0, float(planet.production))
@@ -842,7 +919,12 @@ def evaluate_regular_attack_option(
     launch_step = int(step)
     if int(wait_turns) > 0:
         future_source_x, future_source_y = predict_planet_position(
-            source, wait_turns, step, initial_planets, angular_velocity_map
+            source,
+            wait_turns,
+            step,
+            initial_planets,
+            angular_velocity_map,
+            time_offset=board_time_offset(board_state),
         )
         launch_source = make_planet_proxy(
             source,
@@ -859,6 +941,7 @@ def evaluate_regular_attack_option(
         launch_step,
         initial_planets,
         angular_velocity_map,
+        time_offset=board_time_offset(board_state),
     )
     if not solution or not solution.get("valid", False):
         return None
@@ -1130,6 +1213,7 @@ def build_intercept_candidate(
         initial_planets,
         angular_velocity_map,
         validation_mode=validation_mode,
+        time_offset=board_time_offset(board_state),
     )
     if not solution.get("valid", False):
         return None
@@ -1207,6 +1291,7 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        time_offset=board_time_offset(board_state),
     )
     if not solution.get("valid", False):
         return None
@@ -1238,6 +1323,7 @@ def build_supply_candidate(
         step,
         initial_planets,
         angular_velocity_map,
+        time_offset=board_time_offset(board_state),
     )
     if not solution.get("valid", False):
         return None
@@ -1283,6 +1369,7 @@ def nearest_planet_sniper(obs):
     moves = []
     player = _obs_get(obs, "player", 0)
     step = int(_obs_get(obs, "step", 0) or 0)
+    time_offset = int(_obs_get(obs, "time_offset", 0) or 0)
     raw_planets = _obs_get(obs, "planets", [])
     raw_fleets = _obs_get(obs, "fleets", [])
     initial_planets = _obs_get(obs, "initial_planets", [])
@@ -1308,10 +1395,11 @@ def nearest_planet_sniper(obs):
         "neutral_planets": [planet for planet in targets if int(planet.owner) == -1],
         "initial_planets": initial_planets,
         "angular_velocity_map": angular_velocity_map,
+        "time_offset": int(time_offset),
     }
 
     arrivals_by_target = build_arrivals_by_target(
-        fleets, planets, step, initial_planets, angular_velocity_map
+        fleets, planets, step, initial_planets, angular_velocity_map, time_offset=time_offset
     )
     friendly_arrivals_by_target = defaultdict(list)
     enemy_arrivals_by_target = defaultdict(list)
