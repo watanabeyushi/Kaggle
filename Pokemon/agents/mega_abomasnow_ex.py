@@ -52,74 +52,91 @@ def blocks_ex_attacks(op_active_id: int) -> bool:
     return op_active_id == Crustle
 
 
-def waiting_evolve(field_counts: dict, hand_counts: dict) -> bool:
-    """Snover is ready to evolve into Mega Abomasnow ex this turn."""
-    return (
-        field_counts[Snover] >= 1
-        and field_counts[Mega_Abomasnow_ex] == 0
-        and hand_counts[Mega_Abomasnow_ex] >= 1
-    )
-
-
-def assess_hand_state(
+def can_discard_for_ultra_ball(
+    hand_counts: defaultdict,
     my_state,
-    hand_counts: dict,
-    field_counts: dict,
-    discard_counts: dict,
-    ex_attack_blocked: bool,
-    bench_attacker_index0: int,
+    field_counts: defaultdict,
+) -> bool:
+    """Return True if the hand can afford Ultra Ball's discard cost."""
+    return hand_counts[Basic_Water_Energy] >= 3 or (
+        my_state.handCount >= 4
+        and (
+            field_counts[Mega_Abomasnow_ex] + hand_counts[Mega_Abomasnow_ex] == 0
+            or field_counts[Snover] == 0
+            or field_counts[Kyogre] + hand_counts[Kyogre] == 0
+        )
+    )
+
+
+def want_surfing_beach_for_kyogre_switch(
+    active_id: int,
+    switch_index: int,
     bench_attacker_index1: int,
-) -> tuple[bool, bool, int, bool]:
-    """Return should_draw, bad_hand, draw_boost, want_precious_trolley."""
-    water_in_hand = hand_counts[Basic_Water_Energy]
-    missing_snover = field_counts[Snover] + hand_counts[Snover] == 0
-    missing_mega = field_counts[Mega_Abomasnow_ex] + hand_counts[Mega_Abomasnow_ex] == 0
-    missing_kyogre = field_counts[Kyogre] + hand_counts[Kyogre] == 0
-    mega_attacker_ready = bench_attacker_index0 >= 0
-
-    want_precious = hand_counts[Precious_Trolley] >= 1 and (
-        water_in_hand >= 2
-        or my_state.handCount >= 5
-        or missing_mega
-        or missing_snover
-        or missing_kyogre
-    )
-    if hand_counts[Precious_Trolley] == 0 and (missing_mega or missing_snover or missing_kyogre):
-        want_precious = True
-
-    bad_hand = (
-        water_in_hand >= 3
-        or (my_state.handCount >= 5 and water_in_hand >= 2)
-        or my_state.handCount >= 6
-        or missing_snover
-        or (missing_mega and not mega_attacker_ready)
-        or (missing_kyogre and (ex_attack_blocked or discard_counts[Basic_Water_Energy] >= 3))
-        or want_precious
-    )
-
-    draw_boost = 0
-    if bad_hand:
-        draw_boost += water_in_hand * 400
-        draw_boost += max(0, my_state.handCount - 4) * 300
-        if missing_mega:
-            draw_boost += 800
-        if missing_snover:
-            draw_boost += 600
-        if missing_kyogre:
-            draw_boost += 600
-        if hand_counts[Precious_Trolley] >= 1:
-            draw_boost += 700
-
-    should_draw = bad_hand and not waiting_evolve(field_counts, hand_counts)
-    return should_draw, bad_hand, draw_boost, want_precious
-
-
-def discard_draw_support_count(discard_counts: dict) -> int:
+    stadium_id: int,
+) -> bool:
+    """Prefer Surfing Beach when retreating from Mega to bench Kyogre."""
+    if stadium_id != 0 and stadium_id != Surfing_Beach:
+        return False
     return (
-        discard_counts[Carmine]
-        + discard_counts[Lillie_Determination]
-        + discard_counts[Team_Rockets_Petrel]
+        active_id == Mega_Abomasnow_ex
+        and bench_attacker_index1 >= 0
+        and switch_index >= 0
     )
+
+
+def supporter_search_score(
+    card_id: int,
+    my_state,
+    field_counts: defaultdict,
+    hand_counts: defaultdict,
+    active_id: int,
+    switch_index: int,
+    bench_attacker_index1: int,
+    stadium_id: int,
+) -> int | None:
+    """Score supporters for Petrel deck search / Receiver discard replay.
+
+    Priority baseline: Trolley > Ultra Ball > Lillie > Carmine > Surfing Beach.
+    """
+    handled = {
+        Precious_Trolley,
+        Ultra_Ball,
+        Lillie_Determination,
+        Carmine,
+        Surfing_Beach,
+        Team_Rockets_Petrel,
+        Team_Rockets_Receiver,
+    }
+    if card_id not in handled:
+        return None
+
+    bench_not_full = len(my_state.bench) < 5
+    snover_waiting = field_counts[Snover] >= 1 and field_counts[Mega_Abomasnow_ex] == 0
+    mega_outside_field = field_counts[Mega_Abomasnow_ex] + hand_counts[Mega_Abomasnow_ex] == 0
+
+    if card_id == Precious_Trolley:
+        return 1000 if bench_not_full else 500
+    if card_id == Ultra_Ball:
+        if (
+            snover_waiting
+            and mega_outside_field
+            and can_discard_for_ultra_ball(hand_counts, my_state, field_counts)
+        ):
+            return 850 if bench_not_full else 800
+        return 400
+    if card_id == Lillie_Determination:
+        return 300
+    if card_id == Carmine:
+        return 200
+    if card_id == Surfing_Beach:
+        if want_surfing_beach_for_kyogre_switch(
+            active_id, switch_index, bench_attacker_index1, stadium_id
+        ):
+            return 750
+        return 100
+    if card_id in (Team_Rockets_Petrel, Team_Rockets_Receiver):
+        return 150
+    return 0
 
 
 def get_card(obs: Observation, area: AreaType, index: int, player_index: int) -> Pokemon | Card | None:
@@ -189,6 +206,15 @@ def agent(obs_dict: dict) -> list[int]:
     for card in my_state.discard:
         discard_counts[card.id] += 1
 
+    # Hand quality checks: this deck has many Water Energy cards, so we
+    # proactively seek draw/search supporters when the hand is clunky.
+    non_energy_hand_count = my_state.handCount - hand_counts[Basic_Water_Energy]
+    need_trolley = hand_counts[Precious_Trolley] == 0 and field_counts[Snover] + field_counts[Mega_Abomasnow_ex] <= 1
+    need_mega = field_counts[Mega_Abomasnow_ex] + hand_counts[Mega_Abomasnow_ex] == 0
+    need_kyogre = field_counts[Kyogre] + hand_counts[Kyogre] == 0
+    hand_stuck = my_state.handCount <= 3 or non_energy_hand_count <= 2 or hand_counts[Basic_Water_Energy] >= 4
+    need_draw_support = hand_stuck or need_trolley or need_mega or need_kyogre
+
     op_active_hp = 0
     op_active_id = 0
     for card in state.players[1 - my_index].active:
@@ -204,17 +230,6 @@ def agent(obs_dict: dict) -> list[int]:
         active_id = card.id
 
     ex_attack_blocked = blocks_ex_attacks(op_active_id) and is_ex_card(active_id)
-
-    should_draw, bad_hand, draw_boost, want_precious = assess_hand_state(
-        my_state,
-        hand_counts,
-        field_counts,
-        discard_counts,
-        ex_attack_blocked,
-        bench_attacker_index0,
-        bench_attacker_index1,
-    )
-    discard_support = discard_draw_support_count(discard_counts)
     
     # If opponent HP <= (Basic Water Energy in discard pile * 20), Kyogre can KO.
     prefer_ky = op_active_hp <= 20 * discard_counts[Basic_Water_Energy]
@@ -239,6 +254,11 @@ def agent(obs_dict: dict) -> list[int]:
             if bench_card.id == Kyogre:
                 switch_index = i
                 break
+
+    stadium_id = 0
+    for card in state.stadium:
+        if card != None:
+            stadium_id = card.id
     
     # Iterate over every possible option and assign a heuristic score.
     scores = []  # Score for each action
@@ -270,8 +290,8 @@ def agent(obs_dict: dict) -> list[int]:
                         score += 20
                     elif card.id == Kyogre:
                         score += 10
-                elif context == SelectContext.TO_BENCH or context == SelectContext.TO_HAND:
-                    # When choosing a card to Bench or add to the hand.
+                elif context == SelectContext.TO_BENCH:
+                    # When choosing a Pokémon to Bench.
                     if card.id == Snover:
                         if field_counts[card.id] >= 1:
                             score += 5
@@ -289,24 +309,65 @@ def agent(obs_dict: dict) -> list[int]:
                             score += 1
                         else:
                             score += 20
+                elif context == SelectContext.TO_HAND:
+                    supporter_score = supporter_search_score(
+                        card.id,
+                        my_state,
+                        field_counts,
+                        hand_counts,
+                        active_id,
+                        switch_index,
+                        bench_attacker_index1,
+                        stadium_id,
+                    )
+                    if supporter_score != None:
+                        score = supporter_score
+                    elif card.id == Snover:
+                        if field_counts[card.id] >= 1:
+                            score += 5
+                        elif field_counts[Mega_Abomasnow_ex] >= 1:
+                            score += 15
+                        else:
+                            score += 30
+                    elif card.id == Mega_Abomasnow_ex:
+                        if field_counts[Snover] >= 1 and field_counts[card.id] + hand_counts[card.id] == 0:
+                            score += 100
+                        else:
+                            score += 10
+                    elif card.id == Kyogre:
+                        if field_counts[card.id] >= 1:
+                            score += 1
+                        else:
+                            score += 20
                 elif context == SelectContext.DISCARD:
-                    # When choosing cards to discard.
-                    if card.id == Basic_Water_Energy:
+                    # Receiver replays a supporter from the discard pile.
+                    if o.area == AreaType.DISCARD and o.playerIndex == my_index:
+                        supporter_score = supporter_search_score(
+                            card.id,
+                            my_state,
+                            field_counts,
+                            hand_counts,
+                            active_id,
+                            switch_index,
+                            bench_attacker_index1,
+                            stadium_id,
+                        )
+                        if supporter_score != None:
+                            score = supporter_score
+                    # When choosing cards to discard from hand.
+                    elif card.id == Basic_Water_Energy:
                         score += 100  # Prioritize Basic Water Energy for discard.
                     elif card.id == Mega_Abomasnow_ex:
                         score += 10
                     elif card.id == Carmine:
                         if hand_counts[Lillie_Determination] >= 1:
+                            # If Lillie Determination is in the hand, Carmine is unnecessary.
                             score += 30
-                        elif bad_hand:
-                            score -= 80
                     elif card.id in (Team_Rockets_Petrel, Team_Rockets_Receiver):
                         if hand_counts[Lillie_Determination] >= 1:
                             score += 30
-                        elif bad_hand:
-                            score -= 80
-                    elif card.id == Precious_Trolley and bad_hand:
-                        score -= 100
+                        if card.id == Team_Rockets_Petrel and hand_counts[Team_Rockets_Receiver] >= 1:
+                            score += 80  # Receiver can reuse Petrel from discard.
                     elif card.id == Lillie_Determination:
                         score -= 20
 
@@ -316,54 +377,42 @@ def agent(obs_dict: dict) -> list[int]:
         elif o.type == OptionType.PLAY:
             card = get_card(obs, AreaType.HAND, o.index, my_index)
             score = 10000
-            if card.id == Precious_Trolley:
-                if should_draw and hand_counts[Precious_Trolley] >= 1:
-                    score = 8800 + draw_boost
-                elif want_precious:
-                    score = 3500
-                else:
-                    score = 2500
-            elif card.id == Ultra_Ball:
+            if card.id == Ultra_Ball:
                 if hand_counts[Basic_Water_Energy] >= 3 or (my_state.handCount >= 4 and (field_counts[Mega_Abomasnow_ex] + hand_counts[Mega_Abomasnow_ex] == 0 or field_counts[Mega_Abomasnow_ex] + field_counts[Snover] == 0 or field_counts[Kyogre] == 0)):
-                    score = 5200 + (400 if should_draw else 0)
-                elif should_draw and (field_counts[Snover] + hand_counts[Snover] == 0 or field_counts[Kyogre] + hand_counts[Kyogre] == 0):
-                    score = 4800 + draw_boost
+                    # Only use if Water Energy is abundant or key cards are missing.
+                    score = 4000
                 else:
                     score = -1
-            elif card.id == Team_Rockets_Receiver:
-                if waiting_evolve(field_counts, hand_counts):
-                    score = -1
-                elif discard_counts[Team_Rockets_Petrel] >= 1:
-                    score = 9200 + draw_boost  # Replay Lambda from discard.
-                elif discard_support >= 1:
-                    score = 8600 + draw_boost  # Replay Lillie / Carmine / Lambda.
-                elif should_draw:
-                    score = 7200 + draw_boost  # Virtual 8-Lambda line: dig or set up chain.
-                elif field_counts[Mega_Abomasnow_ex] + field_counts[Snover] == 0:
-                    score = 3200
-                else:
-                    score = -1
-            elif card.id == Team_Rockets_Petrel:
-                if waiting_evolve(field_counts, hand_counts):
-                    score = -1
-                elif should_draw:
-                    score = 8000 + draw_boost  # Search supporters from deck (incl. Lambda).
-                else:
-                    score = 3400
-            elif card.id == Lillie_Determination:
-                if waiting_evolve(field_counts, hand_counts):
-                    score = -1
-                elif should_draw:
-                    score = 7800 + draw_boost
-                else:
-                    score = 3600
             elif card.id == Carmine:
-                if waiting_evolve(field_counts, hand_counts):
+                if field_counts[Snover] >= 1 and hand_counts[Mega_Abomasnow_ex] >= 1:
                     score = -1
-                elif should_draw:
-                    score = 7600 + draw_boost
                 else:
-                    score = 3400
+                    score = 5400 if need_draw_support else 3000
+            elif card.id == Lillie_Determination:
+                if field_counts[Snover] >= 1 and field_counts[Mega_Abomasnow_ex] == 0 and hand_counts[Mega_Abomasnow_ex] >= 1:
+                    score = -1
+                else:
+                    score = 5500 if need_draw_support else 3100  # Prioritize over Carmine.
+            elif card.id == Team_Rockets_Petrel:
+                if field_counts[Snover] >= 1 and field_counts[Mega_Abomasnow_ex] == 0 and hand_counts[Mega_Abomasnow_ex] >= 1:
+                    score = -1
+                else:
+                    # Treat as extra copies of draw supporters when hand quality is poor.
+                    score = 5600 if need_draw_support else 3050
+            elif card.id == Team_Rockets_Receiver:
+                discard_support = (
+                    discard_counts[Carmine]
+                    + discard_counts[Lillie_Determination]
+                    + discard_counts[Team_Rockets_Petrel]
+                )
+                if field_counts[Snover] >= 1 and field_counts[Mega_Abomasnow_ex] == 0 and hand_counts[Mega_Abomasnow_ex] >= 1:
+                    score = -1
+                elif discard_support >= 1:
+                    score = 6000 if need_draw_support else 3200  # Replay draw supporters.
+                elif field_counts[Mega_Abomasnow_ex] + field_counts[Snover] == 0:
+                    score = 4300 if need_draw_support else 3000  # Early game: build the discard pile.
+                else:
+                    score = 3500 if need_draw_support else -1
         elif o.type == OptionType.ATTACH:
             pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
             score = 5000
@@ -408,8 +457,6 @@ def agent(obs_dict: dict) -> list[int]:
             score = 10000 + len(pokemon.energies)
             if blocks_ex_attacks(op_active_id) and ex_attack_blocked:
                 score -= 8000
-            elif should_draw and not waiting_evolve(field_counts, hand_counts):
-                score -= 1500
         elif o.type == OptionType.ABILITY:
             card = get_card(obs, o.area, o.index, my_index)
             if card.id == Surfing_Beach and switch_index >= 0:
